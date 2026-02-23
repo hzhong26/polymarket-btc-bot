@@ -1,0 +1,174 @@
+%PDF-1.4
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [ 3 0 R 4 0 R ] /Count 2 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 7 0 R >> >> /Contents 5 0 R >>
+endobj
+4 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 7 0 R >> >> /Contents 6 0 R >>
+endobj
+5 0 obj
+<< /Length 2761 >>
+stream
+BT
+/F1 11 Tf
+14 TL
+50 760 Td
+/F1 14 Tf
+(Unified Status + Plan \(One View\)) Tj
+/F1 11 Tf
+T*
+() Tj
+T*
+(1\) Current status \(as of your latest logs\)) Tj
+T*
+(- Bot is running and scanning continuously.) Tj
+T*
+(- Last traded decision in the current run was around 2026-02-23 05:01 AM EST from) Tj
+T*
+(  traded-decisions-2026-02-23.json.) Tj
+T*
+(- Since then, evaluations continue, but most end in NO-TRADE due Kelly returning no) Tj
+T*
+(  position.) Tj
+T*
+() Tj
+T*
+(2\) Why no trades are being placed now) Tj
+T*
+(- The primary blocker is the uncertainty gate:) Tj
+T*
+(  - uncertainty_haircut_max = "0.5" in config.toml.) Tj
+T*
+(  - Kelly hard-rejects when model_uncertainty > max_uncertainty in mod.rs.) Tj
+T*
+(- Current per-asset uncertainty values are high:) Tj
+T*
+(  - BTC 0.7007) Tj
+T*
+(  - ETH 0.6567) Tj
+T*
+(  - XRP 0.5357) Tj
+T*
+(  - SOL 0.9192) Tj
+T*
+() Tj
+T*
+(3\) What per-asset uncertainty is) Tj
+T*
+(- It is a calibration reliability score per coin.) Tj
+T*
+(- Computed from rolling Brier score:) Tj
+T*
+(  - model_uncertainty = min\(1.0, 2 * brier_score\) in calibration.rs.) Tj
+T*
+(- Lower is better \(more calibrated\). Higher means model probabilities are less trustworthy.) Tj
+T*
+() Tj
+T*
+(4\) Is the base model accurate enough right now?) Tj
+T*
+(- Infrastructure: yes \(scanner, pipeline, settlement, P&L, logs are functioning\).) Tj
+T*
+(- Predictive quality: not yet proven strong.) Tj
+T*
+(- With current uncertainty levels and near coin-flip outcomes, this is a good operational) Tj
+T*
+(  baseline, not yet a high-confidence trading model.) Tj
+T*
+() Tj
+T*
+(5\) Stage-2 \(fine-tuning\) should look like this) Tj
+T*
+(- Persist calibration history across restarts \(currently it resets each run\).) Tj
+T*
+(- Keep per-asset calibrators \(BTC/ETH/XRP/SOL\) and update only on settled official outcomes.) Tj
+T*
+(- Add warmup logic:) Tj
+T*
+(  - Do not hard-block on uncertainty until minimum settled samples per asset.) Tj
+T*
+(- Use calibrated probabilities for entry and Kelly sizing.) Tj
+T*
+(- Keep sampled no-trade logs for counterfactual learning \(important for improving filters\).) Tj
+T*
+(- Validate with walk-forward time splits only \(no random splits\).) Tj
+T*
+(- Promote config/model only if out-of-sample EV and drawdown improve.) Tj
+T*
+() Tj
+T*
+(6\) Immediate practical changes \(to unblock testing now\)) Tj
+T*
+(- Raise uncertainty_haircut_max from 0.5 to a temporary higher value \(for example 0.85-0.95\)) Tj
+T*
+(  in config.toml.) Tj
+T*
+(- Keep conservative sizing \(kelly_fraction low\) while calibrating.) Tj
+T*
+(- Track per-asset Brier/log-loss trend and win rate on closed trades only.) Tj
+T*
+() Tj
+T*
+(7\) Best next implementation order) Tj
+T*
+(- Calibration persistence + load-on-start.) Tj
+T*
+(- Warmup-aware Kelly gate.) Tj
+T*
+ET
+endstream
+endobj
+6 0 obj
+<< /Length 465 >>
+stream
+BT
+/F1 11 Tf
+14 TL
+50 760 Td
+(- Calibrator layer per asset.) Tj
+T*
+(- Walk-forward evaluation harness using your JSON logs.) Tj
+T*
+(- Policy tuning \(confidence/spread/liquidity/time filters\) from data, not guesswork.) Tj
+T*
+() Tj
+T*
+(Research references) Tj
+T*
+(- scikit-learn Calibration) Tj
+T*
+(- Guo et al. \(2017\) On Calibration) Tj
+T*
+(- TimeSeriesSplit) Tj
+T*
+(- Probability of Backtest Overfitting) Tj
+T*
+(- Online learning with delayed feedback) Tj
+T*
+ET
+endstream
+endobj
+7 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+xref
+0 8
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000129 00000 n 
+0000000255 00000 n 
+0000000381 00000 n 
+0000003194 00000 n 
+0000003710 00000 n 
+trailer
+<< /Size 8 /Root 1 0 R >>
+startxref
+3780
+%%EOF

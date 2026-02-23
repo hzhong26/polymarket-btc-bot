@@ -1,0 +1,95 @@
+[package]
+name = "polymarket-btc-bot"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.75.0"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+
+# HTTP client for price feeds & API calls
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+# WebSocket for Binance streaming + Polymarket WS
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+futures-util = "0.3"
+
+# HTTP server + WebSocket for browser dashboard
+axum = { version = "0.7", features = ["ws"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Decimal arithmetic for monetary values
+rust_decimal = { version = "1", features = ["serde-with-str"] }
+rust_decimal_macros = "1"
+
+# Ethereum / wallet signing (International venue: EIP-712)
+alloy-signer = "1"
+alloy-signer-local = "1"
+alloy-primitives = "1"
+alloy-sol-types = "1"
+
+# Ed25519 signing (US venue)
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+
+# HMAC for L2 auth
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Logging / tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Environment / config
+dotenvy = "0.15"
+
+# Async trait
+async-trait = "0.1"
+
+# Regex for parsing strike prices from market questions
+regex = "1"
+
+# Metrics / observability
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
+
+# Random for nonce generation
+rand = "0.8"
+
+# Secret handling
+secrecy = { version = "0.10", features = ["serde"] }
+
+# TLS crypto provider (required by rustls 0.23+)
+rustls = { version = "0.23", features = ["ring"] }
+
+[dev-dependencies]
+approx = "0.5"
+tokio-test = "0.4"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "lmsr_bench"
+harness = false
+
+[[bench]]
+name = "bayesian_bench"
+harness = false
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
