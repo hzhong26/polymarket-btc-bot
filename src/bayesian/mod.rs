@@ -59,14 +59,16 @@ impl BayesianUpdater {
     /// - `high_vol_threshold`: annualized vol threshold for regime detection
     /// - `tick_interval_secs`: seconds between price observations
     /// - `default_volatility`: fallback annualized vol (e.g. 0.80 = 80%)
+    /// - `ewma_lambda`: EWMA decay factor for volatility (0.94 = RiskMetrics standard)
     pub fn new(
         vol_window: usize,
         high_vol_threshold: f64,
         tick_interval_secs: f64,
         default_volatility: f64,
+        ewma_lambda: f64,
     ) -> Self {
         Self {
-            vol_estimator: VolatilityEstimator::new(vol_window, high_vol_threshold),
+            vol_estimator: VolatilityEstimator::new(vol_window, high_vol_threshold, ewma_lambda),
             tick_interval_secs,
             default_volatility,
         }
@@ -235,6 +237,21 @@ impl BayesianUpdater {
             .unwrap_or(self.default_volatility)
     }
 
+    /// Get the current EWMA variance (per-tick). None if not warmed up.
+    pub fn ewma_variance(&self) -> Option<f64> {
+        self.vol_estimator.ewma_variance()
+    }
+
+    /// Total observations fed into the volatility estimator.
+    pub fn ewma_total_observations(&self) -> usize {
+        self.vol_estimator.total_observations()
+    }
+
+    /// Whether the EWMA estimator has completed warmup.
+    pub fn ewma_warmed_up(&self) -> bool {
+        self.vol_estimator.is_warmed_up()
+    }
+
     fn current_annualized_log_drift(&self) -> f64 {
         let ticks_per_year = (365.25 * 24.0 * 3600.0) / self.tick_interval_secs.max(0.1);
         self.vol_estimator
@@ -323,7 +340,7 @@ mod tests {
 
     #[test]
     fn test_update_atm_market() {
-        let mut updater = BayesianUpdater::new(60, 1.0, 2.0, 0.80);
+        let mut updater = BayesianUpdater::new(60, 1.0, 2.0, 0.80, 0.94);
         let price = make_price(68000.0, 1.0);
         let market = make_market(68000.0, 0.50, 300);
 
@@ -334,7 +351,7 @@ mod tests {
 
     #[test]
     fn test_update_itm_market() {
-        let mut updater = BayesianUpdater::new(60, 1.0, 2.0, 0.80);
+        let mut updater = BayesianUpdater::new(60, 1.0, 2.0, 0.80, 0.94);
         let price = make_price(72000.0, 1.0);
         let market = make_market(68000.0, 0.60, 300);
 
@@ -345,7 +362,7 @@ mod tests {
 
     #[test]
     fn test_low_confidence_shrinks_to_market() {
-        let mut updater = BayesianUpdater::new(60, 1.0, 2.0, 0.80);
+        let mut updater = BayesianUpdater::new(60, 1.0, 2.0, 0.80, 0.94);
         let price = make_price(72000.0, 0.0); // Zero confidence!
         let market = make_market(68000.0, 0.60, 300);
 
@@ -356,7 +373,7 @@ mod tests {
 
     #[test]
     fn test_expired_market() {
-        let mut updater = BayesianUpdater::new(60, 1.0, 2.0, 0.80);
+        let mut updater = BayesianUpdater::new(60, 1.0, 2.0, 0.80, 0.94);
         let price = make_price(72000.0, 1.0);
         let market = make_market(68000.0, 0.60, -10); // Already expired
 
@@ -367,7 +384,7 @@ mod tests {
 
     #[test]
     fn test_update_up_down_market_without_official_reference_rejected() {
-        let mut updater = BayesianUpdater::new(60, 1.0, 2.0, 0.80);
+        let mut updater = BayesianUpdater::new(60, 1.0, 2.0, 0.80, 0.94);
         let price = make_price(2800.0, 0.8);
         let mut market = make_up_down_market(0.70, 300);
         market.polymarket_price_to_beat = None;
@@ -380,7 +397,7 @@ mod tests {
 
     #[test]
     fn test_zero_strike_non_updown_market_rejected() {
-        let mut updater = BayesianUpdater::new(60, 1.0, 2.0, 0.80);
+        let mut updater = BayesianUpdater::new(60, 1.0, 2.0, 0.80, 0.94);
         let price = make_price(68000.0, 1.0);
         let mut market = make_market(68000.0, 0.60, 300);
         market.strike_price = Decimal::ZERO;
@@ -391,7 +408,7 @@ mod tests {
 
     #[test]
     fn test_up_down_directional_model_uses_official_reference() {
-        let mut updater = BayesianUpdater::new(120, 1.0, 2.0, 0.80);
+        let mut updater = BayesianUpdater::new(120, 1.0, 2.0, 0.80, 0.94);
         let now = Utc::now();
         for i in 0..90 {
             let ts = now - chrono::Duration::seconds(180 - (i as i64 * 2));
@@ -410,7 +427,7 @@ mod tests {
 
     #[test]
     fn test_up_down_directional_model_marks_below_reference_as_lower_prob() {
-        let mut updater = BayesianUpdater::new(120, 1.0, 2.0, 0.80);
+        let mut updater = BayesianUpdater::new(120, 1.0, 2.0, 0.80, 0.94);
         let now = Utc::now();
         for i in 0..90 {
             let ts = now - chrono::Duration::seconds(180 - (i as i64 * 2));

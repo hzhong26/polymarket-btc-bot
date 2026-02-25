@@ -117,8 +117,24 @@ pub struct TradingConfig {
     pub dashboard_enabled: bool,
     #[serde(default = "default_dashboard_live_interval_ms")]
     pub dashboard_live_interval_ms: u64,
+    #[serde(default = "default_calibration_min_samples")]
+    pub calibration_min_samples: usize,
+    #[serde(default = "default_vol_window_secs")]
+    pub vol_window_secs: u64,
+    #[serde(default = "default_ewma_lambda")]
+    pub ewma_lambda: f64,
+    #[serde(default = "default_fee_rate")]
+    pub fee_rate: Decimal,
+    #[serde(default = "default_fee_exponent")]
+    pub fee_exponent: u32,
     #[serde(default)]
     pub asset_params: TradingAssetParams,
+    /// Reject trades with net edge above this cap (None = no cap).
+    #[serde(default)]
+    pub max_net_edge: Option<Decimal>,
+    /// Multiply edge threshold for YES-side trades (default 1.0 = no penalty).
+    #[serde(default = "default_multiplier")]
+    pub yes_edge_threshold_mult: Decimal,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -127,6 +143,9 @@ pub struct TradingAssetTuning {
     pub edge_threshold_mult: Decimal,
     #[serde(default = "default_multiplier")]
     pub uncertainty_mult: Decimal,
+    /// Per-asset EWMA lambda override. None = use global `ewma_lambda`.
+    #[serde(default)]
+    pub ewma_lambda: Option<f64>,
 }
 
 impl Default for TradingAssetTuning {
@@ -134,6 +153,7 @@ impl Default for TradingAssetTuning {
         Self {
             edge_threshold_mult: Decimal::ONE,
             uncertainty_mult: Decimal::ONE,
+            ewma_lambda: None,
         }
     }
 }
@@ -148,6 +168,18 @@ pub struct TradingAssetParams {
     pub xrp: TradingAssetTuning,
     #[serde(default)]
     pub sol: TradingAssetTuning,
+}
+
+impl TradingAssetParams {
+    pub fn for_asset(&self, asset: crate::price_feeds::PriceAsset) -> &TradingAssetTuning {
+        use crate::price_feeds::PriceAsset;
+        match asset {
+            PriceAsset::Btc => &self.btc,
+            PriceAsset::Eth => &self.eth,
+            PriceAsset::Xrp => &self.xrp,
+            PriceAsset::Sol => &self.sol,
+        }
+    }
 }
 
 impl Default for TradingAssetParams {
@@ -187,6 +219,26 @@ fn default_min_liquidity() -> Decimal {
 
 fn default_min_time_to_expiry_secs() -> u64 {
     60
+}
+
+fn default_calibration_min_samples() -> usize {
+    30
+}
+
+fn default_vol_window_secs() -> u64 {
+    300
+}
+
+fn default_ewma_lambda() -> f64 {
+    0.94
+}
+
+fn default_fee_rate() -> Decimal {
+    Decimal::new(25, 2) // 0.25
+}
+
+fn default_fee_exponent() -> u32 {
+    2
 }
 
 fn default_multiplier() -> Decimal {

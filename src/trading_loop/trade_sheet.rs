@@ -10,6 +10,7 @@ use crate::trading_loop::pnl::{ClosedTradeRecord, OutcomeTokenSide};
 
 #[derive(Clone)]
 struct TradeRow {
+    run_number: u32,
     coin: String,
     opened_at: DateTime<Utc>,
     end_time: Option<DateTime<Utc>>,
@@ -27,11 +28,15 @@ pub struct TradeSheetWriter {
     rows: Vec<TradeRow>,
     by_token: HashMap<String, usize>,
     path: PathBuf,
+    current_run_number: u32,
+    current_bot_version: String,
+    /// (run_number, version) for all runs seen (including current)
+    run_versions: Vec<(u32, String)>,
 }
 
 impl TradeSheetWriter {
-    pub fn new(log_dir: &str) -> Self {
-        let today = Utc::now().format("%Y-%m-%d").to_string();
+    pub fn new(log_dir: &str, bot_version: &str) -> Self {
+        let today = to_et(Utc::now()).format("%Y-%m-%d").to_string();
         let path = PathBuf::from(log_dir)
             .join(&today)
             .join(format!("trades-{}.csv", today));
@@ -39,6 +44,9 @@ impl TradeSheetWriter {
             rows: Vec::new(),
             by_token: HashMap::new(),
             path,
+            current_run_number: 1,
+            current_bot_version: bot_version.to_string(),
+            run_versions: vec![(1, bot_version.to_string())],
         }
     }
 
@@ -59,6 +67,7 @@ impl TradeSheetWriter {
         let idx = self.rows.len();
         self.by_token.insert(token_id.clone(), idx);
         self.rows.push(TradeRow {
+            run_number: self.current_run_number,
             coin,
             opened_at,
             end_time,
@@ -90,6 +99,7 @@ impl TradeSheetWriter {
             let idx = self.rows.len();
             self.by_token.insert(rec.token_id.clone(), idx);
             self.rows.push(TradeRow {
+                run_number: self.current_run_number,
                 coin: rec.asset.symbol().to_string(),
                 opened_at: rec.opened_at,
                 end_time: rec.end_time,
@@ -115,7 +125,7 @@ impl TradeSheetWriter {
     pub async fn seed_from_today_log(&mut self, log_dir: &str) {
         use tokio::io::{AsyncBufReadExt, BufReader};
 
-        let today = Utc::now().format("%Y-%m-%d").to_string();
+        let today = to_et(Utc::now()).format("%Y-%m-%d").to_string();
         let events_path = PathBuf::from(log_dir)
             .join(&today)
             .join(format!("events-{}.json", today));
@@ -126,15 +136,29 @@ impl TradeSheetWriter {
 
         let mut lines = BufReader::new(file).lines();
         let mut seen: HashSet<String> = HashSet::new();
-        // ordered list of (token_id, row) from pipeline_evaluation events
-        let mut candidates: Vec<(String, TradeRow)> = Vec::new();
+        // ordered list of (token_id, run_id, row) from pipeline_evaluation events
+        let mut candidates: Vec<(String, Option<String>, TradeRow)> = Vec::new();
         // token_id → (actual_yes_outcome, won, realized_pnl)
         let mut settlements: HashMap<String, (bool, bool, Decimal)> = HashMap::new();
+        // Track distinct run_ids in order of first appearance → (run_id, bot_version)
+        let mut discovered_runs: Vec<(String, String)> = Vec::new();
 
         while let Ok(Some(line)) = lines.next_line().await {
             let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) else {
                 continue;
             };
+
+            // Track run_id from every event line (not just trade_candidate)
+            if let Some(rid) = val["run_id"].as_str() {
+                if !discovered_runs.iter().any(|(r, _)| r == rid) {
+                    let ver = val["bot_version"]
+                        .as_str()
+                        .unwrap_or("?")
+                        .to_string();
+                    discovered_runs.push((rid.to_string(), ver));
+                }
+            }
+
             match val["event_type"].as_str() {
                 Some("pipeline_evaluation") => {
                     let p = &val["payload"];
@@ -151,6 +175,8 @@ impl TradeSheetWriter {
                         continue;
                     }
                     seen.insert(token_id.to_string());
+
+                    let run_id = val["run_id"].as_str().map(|s| s.to_string());
 
                     let coin = p["market"]["asset"]
                         .as_str()
@@ -176,7 +202,9 @@ impl TradeSheetWriter {
 
                     candidates.push((
                         token_id.to_string(),
+                        run_id,
                         TradeRow {
+                            run_number: 0, // assigned below after we know all runs
                             coin,
                             opened_at,
                             end_time,
@@ -208,7 +236,33 @@ impl TradeSheetWriter {
             }
         }
 
-        for (token_id, mut row) in candidates {
+        // Build run_id → run_number mapping (1-based, by first appearance order)
+        let run_id_to_number: HashMap<&str, u32> = discovered_runs
+            .iter()
+            .enumerate()
+            .map(|(i, (rid, _))| (rid.as_str(), (i + 1) as u32))
+            .collect();
+
+        // Populate run_versions from discovered runs
+        if !discovered_runs.is_empty() {
+            self.run_versions = discovered_runs
+                .iter()
+                .enumerate()
+                .map(|(i, (_, ver))| ((i + 1) as u32, ver.clone()))
+                .collect();
+            self.current_run_number = discovered_runs.len() as u32 + 1;
+            // Add current run to run_versions
+            self.run_versions
+                .push((self.current_run_number, self.current_bot_version.clone()));
+        }
+
+        for (token_id, run_id, mut row) in candidates {
+            // Assign run_number based on the run_id this trade came from
+            row.run_number = run_id
+                .as_deref()
+                .and_then(|rid| run_id_to_number.get(rid).copied())
+                .unwrap_or(1);
+
             if let Some(&(actual_yes, won, pnl)) = settlements.get(&token_id) {
                 row.status = "CLOSED".to_string();
                 row.result = Some(actual_yes);
@@ -237,46 +291,82 @@ impl TradeSheetWriter {
     }
 
     pub(crate) fn build_csv(&self) -> String {
-        let mut out = String::from(
-            "#,Coin,Date & Time,Timeframe,Status,Decision,Result,W/L,Stake ($),P&L ($),Fee (~$)\n",
-        );
-        for (rev_i, row) in self.rows.iter().rev().enumerate() {
-            let n = rev_i + 1;
-            let dt = to_et(row.opened_at).format("%m/%d %H:%M:%S").to_string();
-            let tf = fmt_timeframe(row.end_time, row.window_start);
-            let decision = if row.side == "YES" { "UP" } else { "DOWN" };
-            let result_str = row
-                .result
-                .map(|r| if r { "UP" } else { "DOWN" })
-                .unwrap_or("");
-            let wl = match row.won {
-                Some(true) => "WIN",
-                Some(false) => "LOSS",
-                None => "",
-            };
-            let stake = row
-                .kelly_stake_usdc
-                .map(|v| format!("${:.2}", v))
-                .unwrap_or_default();
-            let pnl = row
-                .realized_pnl
-                .and_then(|v| v.to_f64())
-                .map(|v| {
-                    if v >= 0.0 {
-                        format!("+${:.2}", v)
-                    } else {
-                        format!("-${:.2}", v.abs())
-                    }
-                })
-                .unwrap_or_default();
-            let fee = match (row.cost_fee_rate, row.kelly_stake_usdc) {
-                (Some(r), Some(s)) => format!("~${:.2}", r * s),
-                _ => String::new(),
-            };
-            out += &format!(
-                "{},{},{},{},{},{},{},{},{},{},{}\n",
-                n, row.coin, dt, tf, row.status, decision, result_str, wl, stake, pnl, fee
-            );
+        let mut out = String::new();
+
+        // Collect all distinct run numbers present in rows + current run
+        let mut run_numbers: Vec<u32> = self
+            .rows
+            .iter()
+            .map(|r| r.run_number)
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        // Ensure current run is included even if it has no rows yet
+        if !run_numbers.contains(&self.current_run_number) {
+            run_numbers.push(self.current_run_number);
+        }
+        run_numbers.sort();
+
+        for &run_num in &run_numbers {
+            // Find version for this run
+            let version = self
+                .run_versions
+                .iter()
+                .find(|(n, _)| *n == run_num)
+                .map(|(_, v)| v.as_str())
+                .unwrap_or("?");
+
+            out += &format!("--- Run {} (v{}) ---\n", run_num, version);
+            out += "#,Coin,Date & Time,Timeframe,Status,Decision,Result,W/L,Stake ($),P&L ($),Fee (~$)\n";
+
+            // Get rows for this run, reversed (newest first)
+            let run_rows: Vec<&TradeRow> = self
+                .rows
+                .iter()
+                .filter(|r| r.run_number == run_num)
+                .rev()
+                .collect();
+
+            for (rev_i, row) in run_rows.iter().enumerate() {
+                let n = rev_i + 1;
+                let dt = to_et(row.opened_at).format("%m/%d %H:%M:%S").to_string();
+                let tf = fmt_timeframe(row.end_time, row.window_start);
+                let decision = if row.side == "YES" { "UP" } else { "DOWN" };
+                let result_str = row
+                    .result
+                    .map(|r| if r { "UP" } else { "DOWN" })
+                    .unwrap_or("");
+                let wl = match row.won {
+                    Some(true) => "WIN",
+                    Some(false) => "LOSS",
+                    None => "",
+                };
+                let stake = row
+                    .kelly_stake_usdc
+                    .map(|v| format!("${:.2}", v))
+                    .unwrap_or_default();
+                let pnl = row
+                    .realized_pnl
+                    .and_then(|v| v.to_f64())
+                    .map(|v| {
+                        if v >= 0.0 {
+                            format!("+${:.2}", v)
+                        } else {
+                            format!("-${:.2}", v.abs())
+                        }
+                    })
+                    .unwrap_or_default();
+                let fee = match (row.cost_fee_rate, row.kelly_stake_usdc) {
+                    (Some(r), Some(s)) => format!("~${:.2}", r * s),
+                    _ => String::new(),
+                };
+                out += &format!(
+                    "{},{},{},{},{},{},{},{},{},{},{}\n",
+                    n, row.coin, dt, tf, row.status, decision, result_str, wl, stake, pnl, fee
+                );
+            }
+
+            out += "\n";
         }
 
         out += &self.build_summary();
@@ -480,6 +570,9 @@ mod tests {
             rows: Vec::new(),
             by_token: HashMap::new(),
             path: PathBuf::from("/tmp/trade-sheet-test.csv"),
+            current_run_number: 1,
+            current_bot_version: "0.0.0-test".to_string(),
+            run_versions: vec![(1, "0.0.0-test".to_string())],
         }
     }
 
@@ -492,6 +585,7 @@ mod tests {
         fee_rate: f64,
     ) -> TradeRow {
         TradeRow {
+            run_number: 1,
             coin: coin.to_string(),
             opened_at,
             end_time: Some(opened_at + chrono::Duration::seconds(window_secs)),
@@ -525,6 +619,7 @@ mod tests {
             avg_entry_price: Decimal::new(50, 2),
             quantity: Decimal::from(10),
             predicted_yes_prob: 0.6,
+            model_yes_prob: 0.58,
             actual_yes_outcome: actual_yes,
             payout_price: Decimal::ONE,
             realized_pnl: pnl,
@@ -540,10 +635,10 @@ mod tests {
         csv.lines().nth(n).unwrap().split(',').collect()
     }
 
-    /// Count only the trade data lines (header + rows), excluding the summary section.
-    fn trade_line_count(csv: &str) -> usize {
+    /// Count only trade data rows (lines starting with a digit, e.g. "1,BTC,...").
+    fn trade_data_count(csv: &str) -> usize {
         csv.lines()
-            .take_while(|line| !line.is_empty() && !line.contains("--- SUMMARY"))
+            .filter(|line| line.starts_with(|c: char| c.is_ascii_digit()))
             .count()
     }
 
@@ -591,13 +686,16 @@ mod tests {
     // ── build_csv: header ─────────────────────────────────────────────────────
 
     #[test]
-    fn empty_writer_produces_only_header() {
+    fn empty_writer_produces_run_header_and_csv_header() {
         let w = writer();
         let csv = w.build_csv();
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(lines[0], "--- Run 1 (v0.0.0-test) ---");
         assert_eq!(
-            csv,
-            "#,Coin,Date & Time,Timeframe,Status,Decision,Result,W/L,Stake ($),P&L ($),Fee (~$)\n"
+            lines[1],
+            "#,Coin,Date & Time,Timeframe,Status,Decision,Result,W/L,Stake ($),P&L ($),Fee (~$)"
         );
+        assert_eq!(trade_data_count(&csv), 0);
     }
 
     // ── build_csv: OPEN row columns ───────────────────────────────────────────
@@ -609,7 +707,7 @@ mod tests {
         w.by_token.insert("tok1".into(), 0);
 
         let csv = w.build_csv();
-        let cols = data_row(&csv, 1);
+        let cols = data_row(&csv, 2); // line 0=run header, 1=csv header, 2=data
 
         assert_eq!(cols[0], "1");           // #
         assert_eq!(cols[1], "BTC");         // Coin
@@ -631,7 +729,7 @@ mod tests {
         w.by_token.insert("tok1".into(), 0);
 
         let csv = w.build_csv();
-        let cols = data_row(&csv, 1);
+        let cols = data_row(&csv, 2);
         assert_eq!(cols[5], "DOWN");
     }
 
@@ -650,7 +748,7 @@ mod tests {
         w.by_token.insert("tok1".into(), 0);
 
         let csv = w.build_csv();
-        let cols = data_row(&csv, 1);
+        let cols = data_row(&csv, 2);
         assert_eq!(cols[4], "CLOSED");
         assert_eq!(cols[5], "UP");
         assert_eq!(cols[6], "UP");      // actual_yes_outcome = true → UP
@@ -673,7 +771,7 @@ mod tests {
         w.by_token.insert("tok1".into(), 0);
 
         let csv = w.build_csv();
-        let cols = data_row(&csv, 1);
+        let cols = data_row(&csv, 2);
         assert_eq!(cols[6], "DOWN");    // actual_yes_outcome = false → DOWN
         assert_eq!(cols[7], "LOSS");
         assert_eq!(cols[9], "-$45.00");
@@ -691,8 +789,8 @@ mod tests {
         w.by_token.insert("tok2".into(), 1);
 
         let csv = w.build_csv();
-        let first_data = data_row(&csv, 1);
-        let second_data = data_row(&csv, 2);
+        let first_data = data_row(&csv, 2); // line 0=run header, 1=csv header
+        let second_data = data_row(&csv, 3);
 
         // Newest (ETH, tok2) should be row #1
         assert_eq!(first_data[0], "1");
@@ -713,8 +811,8 @@ mod tests {
         w.record_opened("tok1".into(), "BTC".into(), opened, end, Some(opened), "YES".into(), Some(52.0), Some(0.02));
 
         let csv = w.build_csv();
-        // Only 1 data row (header + 1)
-        assert_eq!(trade_line_count(&csv), 2);
+        // Only 1 data row
+        assert_eq!(trade_data_count(&csv), 1);
     }
 
     // ── record_closed: known token updates in-place ───────────────────────────
@@ -732,7 +830,7 @@ mod tests {
         w.record_closed(&rec);
 
         let csv = w.build_csv();
-        let cols = data_row(&csv, 1);
+        let cols = data_row(&csv, 2);
         assert_eq!(cols[4], "CLOSED");
         assert_eq!(cols[6], "UP");
         assert_eq!(cols[7], "WIN");
@@ -755,7 +853,7 @@ mod tests {
         w.record_closed(&rec);
 
         let csv = w.build_csv();
-        let cols = data_row(&csv, 1);
+        let cols = data_row(&csv, 2);
         assert_eq!(cols[7], "LOSS");
     }
 
@@ -769,8 +867,8 @@ mod tests {
         w.record_closed(&rec);
 
         let csv = w.build_csv();
-        assert_eq!(trade_line_count(&csv), 2, "expected header + 1 row");
-        let cols = data_row(&csv, 1);
+        assert_eq!(trade_data_count(&csv), 1, "expected 1 data row");
+        let cols = data_row(&csv, 2);
         assert_eq!(cols[1], "BTC");     // from rec.asset.symbol()
         assert_eq!(cols[4], "CLOSED");
         assert_eq!(cols[5], "UP");      // YES side
@@ -792,7 +890,7 @@ mod tests {
 
     /// Write a minimal events JSONL file that seed_from_today_log can parse.
     fn write_events_file(dir: &std::path::Path, lines: &[serde_json::Value]) {
-        let today = Utc::now().format("%Y-%m-%d").to_string();
+        let today = to_et(Utc::now()).format("%Y-%m-%d").to_string();
         let day_dir = dir.join(&today);
         std::fs::create_dir_all(&day_dir).unwrap();
         let path = day_dir.join(format!("events-{}.json", today));
@@ -803,6 +901,9 @@ mod tests {
             .join("\n");
         std::fs::write(&path, content).unwrap();
     }
+
+    const TEST_RUN_ID: &str = "test-run-1";
+    const TEST_BOT_VERSION: &str = "0.0.0-test";
 
     fn pipeline_eval_line(
         token_id_yes: &str,
@@ -816,10 +917,32 @@ mod tests {
         end_time: DateTime<Utc>,
         start_time: DateTime<Utc>,
     ) -> serde_json::Value {
+        pipeline_eval_line_with_run(
+            token_id_yes, token_id_no, edge_side, asset, stake, fee, seq,
+            opened_at, end_time, start_time, TEST_RUN_ID, TEST_BOT_VERSION,
+        )
+    }
+
+    fn pipeline_eval_line_with_run(
+        token_id_yes: &str,
+        token_id_no: &str,
+        edge_side: &str,
+        asset: &str,
+        stake: f64,
+        fee: f64,
+        seq: u64,
+        opened_at: DateTime<Utc>,
+        end_time: DateTime<Utc>,
+        start_time: DateTime<Utc>,
+        run_id: &str,
+        bot_version: &str,
+    ) -> serde_json::Value {
         serde_json::json!({
             "event_type": "pipeline_evaluation",
             "event_ts": opened_at.to_rfc3339(),
             "seq": seq,
+            "run_id": run_id,
+            "bot_version": bot_version,
             "payload": {
                 "market": {
                     "token_id_yes": token_id_yes,
@@ -839,9 +962,22 @@ mod tests {
     }
 
     fn settlement_line(token_id: &str, actual_yes: bool, won: bool, pnl: f64) -> serde_json::Value {
+        settlement_line_with_run(token_id, actual_yes, won, pnl, TEST_RUN_ID, TEST_BOT_VERSION)
+    }
+
+    fn settlement_line_with_run(
+        token_id: &str,
+        actual_yes: bool,
+        won: bool,
+        pnl: f64,
+        run_id: &str,
+        bot_version: &str,
+    ) -> serde_json::Value {
         serde_json::json!({
             "event_type": "position_settled",
             "event_ts": Utc::now().to_rfc3339(),
+            "run_id": run_id,
+            "bot_version": bot_version,
             "payload": {
                 "token_id": token_id,
                 "actual_yes_outcome": actual_yes,
@@ -861,13 +997,13 @@ mod tests {
             pipeline_eval_line("yes-tok", "no-tok", "BUY YES", "BTC", 52.0, 0.02, 1, opened, end, opened),
         ]);
 
-        let mut w = TradeSheetWriter::new(dir.to_str().unwrap());
+        let mut w = TradeSheetWriter::new(dir.to_str().unwrap(), TEST_BOT_VERSION);
         w.seed_from_today_log(dir.to_str().unwrap()).await;
 
         let csv = w.build_csv();
-        let lines: Vec<&str> = csv.lines().collect();
-        assert_eq!(lines.len(), 2, "expected header + 1 row");
-        let cols: Vec<&str> = lines[1].split(',').collect();
+        assert_eq!(trade_data_count(&csv), 1, "expected 1 data row");
+        // Run 1: line 0=run header, 1=csv header, 2=data
+        let cols: Vec<&str> = csv.lines().nth(2).unwrap().split(',').collect();
         assert_eq!(cols[1], "BTC");
         assert_eq!(cols[3], "5min");
         assert_eq!(cols[4], "OPEN");
@@ -887,11 +1023,11 @@ mod tests {
             settlement_line("yes-tok", true, true, 29.0),
         ]);
 
-        let mut w = TradeSheetWriter::new(dir.to_str().unwrap());
+        let mut w = TradeSheetWriter::new(dir.to_str().unwrap(), TEST_BOT_VERSION);
         w.seed_from_today_log(dir.to_str().unwrap()).await;
 
         let csv = w.build_csv();
-        let cols: Vec<&str> = csv.lines().nth(1).unwrap().split(',').collect();
+        let cols: Vec<&str> = csv.lines().nth(2).unwrap().split(',').collect();
         assert_eq!(cols[4], "CLOSED");
         assert_eq!(cols[6], "UP");    // actual_yes = true
         assert_eq!(cols[7], "WIN");
@@ -908,11 +1044,11 @@ mod tests {
             pipeline_eval_line("yes-tok", "no-tok", "BUY NO", "ETH", 40.0, 0.02, 1, opened, end, opened),
         ]);
 
-        let mut w = TradeSheetWriter::new(dir.to_str().unwrap());
+        let mut w = TradeSheetWriter::new(dir.to_str().unwrap(), TEST_BOT_VERSION);
         w.seed_from_today_log(dir.to_str().unwrap()).await;
 
         let csv = w.build_csv();
-        let cols: Vec<&str> = csv.lines().nth(1).unwrap().split(',').collect();
+        let cols: Vec<&str> = csv.lines().nth(2).unwrap().split(',').collect();
         assert_eq!(cols[1], "ETH");
         assert_eq!(cols[3], "15min");
         assert_eq!(cols[5], "DOWN");  // NO side → DOWN
@@ -939,10 +1075,10 @@ mod tests {
             }),
         ]);
 
-        let mut w = TradeSheetWriter::new(dir.to_str().unwrap());
+        let mut w = TradeSheetWriter::new(dir.to_str().unwrap(), TEST_BOT_VERSION);
         w.seed_from_today_log(dir.to_str().unwrap()).await;
 
-        assert_eq!(w.build_csv().lines().count(), 1, "no_trade rows should be skipped");
+        assert_eq!(trade_data_count(&w.build_csv()), 0, "no_trade rows should be skipped");
     }
 
     #[tokio::test]
@@ -954,10 +1090,10 @@ mod tests {
 
         write_events_file(&dir, &[ev.clone(), ev]);
 
-        let mut w = TradeSheetWriter::new(dir.to_str().unwrap());
+        let mut w = TradeSheetWriter::new(dir.to_str().unwrap(), TEST_BOT_VERSION);
         w.seed_from_today_log(dir.to_str().unwrap()).await;
 
-        assert_eq!(w.build_csv().lines().count(), 2, "duplicate token_id should only add one row");
+        assert_eq!(trade_data_count(&w.build_csv()), 1, "duplicate token_id should only add one row");
     }
 
     #[tokio::test]
@@ -967,7 +1103,7 @@ mod tests {
         let end = Some(opened + chrono::Duration::seconds(300));
 
         // Manually add a row before seeding
-        let mut w = TradeSheetWriter::new(dir.to_str().unwrap());
+        let mut w = TradeSheetWriter::new(dir.to_str().unwrap(), TEST_BOT_VERSION);
         w.record_opened("yes-tok".into(), "BTC".into(), opened, end, Some(opened), "YES".into(), Some(99.0), Some(0.05));
 
         // Log has different stake for same token
@@ -976,19 +1112,19 @@ mod tests {
         ]);
         w.seed_from_today_log(dir.to_str().unwrap()).await;
 
-        // Should still have only 1 row, with original stake $99
+        // Should still have only 1 data row, with original stake $99
         let csv = w.build_csv();
-        assert_eq!(csv.lines().count(), 2);
+        assert_eq!(trade_data_count(&csv), 1);
         assert!(csv.contains("$99.00"), "pre-recorded row should not be overwritten by seed");
     }
 
     #[tokio::test]
     async fn seed_returns_silently_when_log_missing() {
         let dir = temp_log_dir("missing");
-        let mut w = TradeSheetWriter::new(dir.to_str().unwrap());
+        let mut w = TradeSheetWriter::new(dir.to_str().unwrap(), TEST_BOT_VERSION);
         // No events file written
         w.seed_from_today_log(dir.to_str().unwrap()).await;
-        assert_eq!(w.build_csv().lines().count(), 1); // header only
+        assert_eq!(trade_data_count(&w.build_csv()), 0); // no data rows
     }
 
     // ── fee edge cases ────────────────────────────────────────────────────────
@@ -1004,7 +1140,56 @@ mod tests {
         w.by_token.insert("tok1".into(), 0);
 
         let csv = w.build_csv();
-        let cols = data_row(&csv, 1);
+        let cols = data_row(&csv, 2);
         assert_eq!(cols[10], "");
+    }
+
+    // ── multi-run grouping ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn seed_discovers_multiple_runs_and_groups_them() {
+        let dir = temp_log_dir("multirun");
+        let opened1 = ts(10, 0, 0);
+        let end1 = opened1 + chrono::Duration::seconds(300);
+        let opened2 = ts(14, 0, 0);
+        let end2 = opened2 + chrono::Duration::seconds(300);
+
+        write_events_file(&dir, &[
+            pipeline_eval_line_with_run(
+                "yes-tok1", "no-tok1", "BUY YES", "BTC", 52.0, 0.02, 1,
+                opened1, end1, opened1, "run-morning", "1.0.0",
+            ),
+            settlement_line_with_run("yes-tok1", true, true, 29.0, "run-morning", "1.0.0"),
+            pipeline_eval_line_with_run(
+                "yes-tok2", "no-tok2", "BUY NO", "ETH", 40.0, 0.02, 2,
+                opened2, end2, opened2, "run-afternoon", "1.1.0",
+            ),
+        ]);
+
+        let mut w = TradeSheetWriter::new(dir.to_str().unwrap(), "1.1.0");
+        w.seed_from_today_log(dir.to_str().unwrap()).await;
+
+        let csv = w.build_csv();
+        let lines: Vec<&str> = csv.lines().collect();
+
+        // Run 1 header
+        assert!(lines[0].contains("Run 1") && lines[0].contains("v1.0.0"));
+        // Run 1 data (BTC trade, closed)
+        let r1_data: Vec<&str> = lines[2].split(',').collect();
+        assert_eq!(r1_data[1], "BTC");
+        assert_eq!(r1_data[4], "CLOSED");
+
+        // Find Run 2 header
+        let run2_idx = lines.iter().position(|l| l.contains("Run 2")).unwrap();
+        assert!(lines[run2_idx].contains("v1.1.0"));
+        // Run 2 data (ETH trade, open)
+        let r2_data: Vec<&str> = lines[run2_idx + 2].split(',').collect();
+        assert_eq!(r2_data[1], "ETH");
+        assert_eq!(r2_data[4], "OPEN");
+        assert_eq!(r2_data[5], "DOWN"); // NO → DOWN
+
+        // Current run (Run 3) should also appear
+        assert!(lines.iter().any(|l| l.contains("Run 3")));
+        assert_eq!(w.current_run_number, 3);
     }
 }

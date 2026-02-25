@@ -10,6 +10,8 @@ use tracing::{error, info, warn};
 use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::time::FormatTime;
 
+use std::collections::HashMap;
+
 use polymarket_btc_bot::bayesian::BayesianUpdater;
 use polymarket_btc_bot::config;
 use polymarket_btc_bot::edge::FeeModel;
@@ -44,8 +46,18 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = parse_cli_args();
 
+    if let Some(dirs) = cli.runs_dirs {
+        return polymarket_btc_bot::analyze::list_runs(&dirs);
+    }
+    if let Some(dirs) = cli.analyze_dirs {
+        return polymarket_btc_bot::analyze::run(&dirs, cli.run_filter.as_deref());
+    }
+
     // Parse config
-    let app_config = config::load_config(&cli.config_path).context("failed to load config")?;
+    let mut app_config = config::load_config(&cli.config_path).context("failed to load config")?;
+    if cli.no_log {
+        app_config.logging.jsonl.enabled = false;
+    }
     validate_startup_config(&app_config)?;
     let config_debug = format!("{:?}", app_config);
 
@@ -191,12 +203,20 @@ async fn main() -> anyhow::Result<()> {
     // Build trading components
     let scanner = GammaScanner::new(app_config.trading.clone());
 
-    let bayesian = BayesianUpdater::new(
-        60,  // vol window
-        1.0, // high vol threshold
-        app_config.price_feeds.poll_interval_ms as f64 / 1000.0,
-        0.80, // default annualized vol
-    );
+    let tick_secs = app_config.price_feeds.poll_interval_ms as f64 / 1000.0;
+    let vol_window_obs = (app_config.trading.vol_window_secs as f64 / tick_secs).ceil() as usize;
+    let bayesian_by_asset: HashMap<PriceAsset, BayesianUpdater> = PriceAsset::ALL
+        .into_iter()
+        .map(|asset| {
+            let lambda = app_config
+                .trading
+                .asset_params
+                .for_asset(asset)
+                .ewma_lambda
+                .unwrap_or(app_config.trading.ewma_lambda);
+            (asset, BayesianUpdater::new(vol_window_obs, 1.0, tick_secs, 0.80, lambda))
+        })
+        .collect();
 
     let kelly = KellySizer::new(
         app_config.trading.kelly_fraction.to_f64().unwrap_or(0.25),
@@ -217,7 +237,11 @@ async fn main() -> anyhow::Result<()> {
     };
     let risk_manager = RiskManager::new(app_config.risk.clone(), starting_balance);
 
-    let fee_model = FeeModel::new(venue_ref.fee_schedule(), app_config.trading.latency_penalty);
+    let fee_model = FeeModel::with_dynamic(
+        app_config.trading.fee_rate,
+        app_config.trading.fee_exponent,
+        app_config.trading.latency_penalty,
+    );
 
     let clock_guard = ClockGuard::new(app_config.risk.max_quote_age_ms);
     let kill_switch = KillSwitch::new(&app_config.risk.ws_disconnect_action);
@@ -239,7 +263,7 @@ async fn main() -> anyhow::Result<()> {
         app_config.trading,
         app_config.price_feeds,
         scanner,
-        bayesian,
+        bayesian_by_asset,
         kelly,
         executor,
         risk_manager,
@@ -308,20 +332,84 @@ impl FormatTime for EasternTimeFormatter {
 struct CliArgs {
     config_path: String,
     paper_mode: bool,
+    no_log: bool,
+    analyze_dirs: Option<Vec<String>>,
+    runs_dirs: Option<Vec<String>>,
+    run_filter: Option<String>,
 }
 
 fn parse_cli_args() -> CliArgs {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let config_path = args
+
+    // Extract --run <value> if present (used with --analyze or --runs)
+    let mut run_filter: Option<String> = None;
+    let mut skip_next = false;
+    let mut args_without_run: Vec<String> = Vec::new();
+    for (i, arg) in args.iter().enumerate() {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if arg == "--run" {
+            if let Some(val) = args.get(i + 1) {
+                run_filter = Some(val.clone());
+                skip_next = true;
+                continue;
+            }
+        }
+        args_without_run.push(arg.clone());
+    }
+
+    let runs_mode = args_without_run.iter().any(|a| a == "--runs");
+    if runs_mode {
+        let dirs: Vec<String> = args_without_run
+            .iter()
+            .filter(|a| !a.starts_with("--"))
+            .cloned()
+            .collect();
+        return CliArgs {
+            config_path: String::new(),
+            paper_mode: false,
+            no_log: false,
+            analyze_dirs: None,
+            runs_dirs: Some(dirs),
+            run_filter: None,
+        };
+    }
+
+    let analyze_mode = args_without_run.iter().any(|a| a == "--analyze");
+    if analyze_mode {
+        // Collect non-flag args as log dirs
+        let dirs: Vec<String> = args_without_run
+            .iter()
+            .filter(|a| !a.starts_with("--"))
+            .cloned()
+            .collect();
+        return CliArgs {
+            config_path: String::new(),
+            paper_mode: false,
+            no_log: false,
+            analyze_dirs: Some(dirs),
+            runs_dirs: None,
+            run_filter,
+        };
+    }
+
+    let config_path = args_without_run
         .iter()
         .find(|a| !a.starts_with("--"))
         .cloned()
         .unwrap_or_else(|| "config.toml".into());
-    let paper_mode = args.iter().any(|a| a == "--dry-run" || a == "--paper");
+    let paper_mode = args_without_run.iter().any(|a| a == "--dry-run" || a == "--paper");
+    let no_log = args_without_run.iter().any(|a| a == "--no-log");
 
     CliArgs {
         config_path,
         paper_mode,
+        no_log,
+        analyze_dirs: None,
+        runs_dirs: None,
+        run_filter: None,
     }
 }
 
@@ -406,10 +494,21 @@ fn validate_startup_config(cfg: &config::AppConfig) -> anyhow::Result<()> {
             "trading.asset_params.{}.uncertainty_mult must be >= 0",
             asset
         );
+        if let Some(lambda) = params.ewma_lambda {
+            ensure!(
+                lambda > 0.0 && lambda < 1.0,
+                "trading.asset_params.{}.ewma_lambda must be in (0, 1)",
+                asset
+            );
+        }
     }
     ensure!(
         cfg.trading.paper_bankroll_usdc > rust_decimal::Decimal::ZERO,
         "trading.paper_bankroll_usdc must be > 0"
+    );
+    ensure!(
+        cfg.trading.ewma_lambda > 0.0 && cfg.trading.ewma_lambda < 1.0,
+        "trading.ewma_lambda must be in (0, 1)"
     );
     if cfg.trading.dashboard_enabled {
         ensure!(
@@ -497,12 +596,16 @@ fn build_price_feeds(price_feeds: &config::PriceFeedConfig) -> (Vec<Box<dyn Pric
     let mut feeds: Vec<Box<dyn PriceFeed>> = Vec::new();
 
     if price_feeds.chainlink_continuous_enabled {
-        feeds.push(Box::new(ChainlinkFeed::new(
-            PriceAsset::Btc,
-            &price_feeds.chainlink_rpc_url,
-            &price_feeds.chainlink_btc_usd_address,
-            poll_interval,
-        )));
+        for asset in PriceAsset::ALL {
+            if let Some(address) = price_feeds.chainlink_address_for_asset(asset) {
+                feeds.push(Box::new(ChainlinkFeed::new(
+                    asset,
+                    &price_feeds.chainlink_rpc_url,
+                    address,
+                    poll_interval,
+                )));
+            }
+        }
     }
 
     feeds.push(Box::new(BinanceFeed::new(&price_feeds.binance_ws_url)));
@@ -585,7 +688,14 @@ mod tests {
                 paper_bankroll_usdc: Decimal::from(1_000),
                 dashboard_enabled: true,
                 dashboard_live_interval_ms: 5_000,
+                calibration_min_samples: 30,
+                vol_window_secs: 300,
+                ewma_lambda: 0.94,
+                fee_rate: Decimal::new(25, 2),
+                fee_exponent: 2,
                 asset_params: Default::default(),
+                max_net_edge: None,
+                yes_edge_threshold_mult: Decimal::ONE,
             },
             risk: config::RiskConfig {
                 max_position_usdc: Decimal::from(500),

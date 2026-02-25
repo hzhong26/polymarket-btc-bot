@@ -24,7 +24,7 @@ chainlink_xrp_usd_address = "0x785ba89291f676b5386652eB12b30cF361020694"
 captured_reference_for_entry = true
 # Gate continuous Chainlink polling (default off to save RPC quota).
 # One-shot calls at window open are always available when captured_reference_for_entry=true.
-chainlink_continuous_enabled = false
+chainlink_continuous_enabled = true
 
 # Cross-check feeds
 binance_ws_url = "wss://stream.binance.us:9443/stream?streams=btcusdt@ticker/ethusdt@ticker/xrpusdt@ticker/solusdt@ticker"
@@ -49,7 +49,7 @@ scan_interval_ms = 30000
 tick_interval_ms = 500
 edge_threshold = "0.11"
 kelly_fraction = "0.12"
-uncertainty_haircut_max = "0.5"
+uncertainty_haircut_max = "0.90"
 latency_penalty = "0.005"
 # Restrict scanner universe to requested crypto assets.
 market_tags = ["bitcoin", "ethereum", "xrp", "solana"]
@@ -59,8 +59,21 @@ min_confidence = "0.80"
 max_spread_ratio = "0.01"
 min_liquidity = "1000"
 min_time_to_expiry_secs = 60
+calibration_min_samples = 30
 # Paper-mode bankroll used for Kelly/risk when running with --paper.
-paper_bankroll_usdc = "1000"
+paper_bankroll_usdc = "10000"
+# Volatility estimation window in seconds (default 300 = 5 minutes).
+vol_window_secs = 300
+# EWMA decay factor for volatility (0.94 = RiskMetrics standard).
+# Higher = more weight on history; lower = faster reaction to new data.
+ewma_lambda = 0.94
+# Polymarket dynamic fee: fee_per_share = fee_rate × (p × (1-p))^fee_exponent
+fee_rate = "0.25"
+fee_exponent = 2
+# Reject trades with net edge above this cap (suspiciously large edges lose money).
+max_net_edge = "0.20"
+# YES-side trades must clear threshold × this multiplier (YES underperforms historically).
+yes_edge_threshold_mult = "1.2"
 # Dashboard controls
 dashboard_enabled = true
 dashboard_live_interval_ms = 5000
@@ -74,12 +87,14 @@ edge_threshold_mult = "1.0"
 uncertainty_mult = "1.0"
 
 [trading.asset_params.xrp]
-edge_threshold_mult = "1.0"
+edge_threshold_mult = "1.5"    # effective threshold: 0.165
 uncertainty_mult = "1.0"
+ewma_lambda = 0.90             # faster EWMA reaction for noisier asset
 
 [trading.asset_params.sol]
-edge_threshold_mult = "1.0"
+edge_threshold_mult = "2.5"    # effective threshold: 0.275
 uncertainty_mult = "1.0"
+ewma_lambda = 0.90             # faster EWMA reaction for noisier asset
 
 [risk]
 max_position_usdc = "500"

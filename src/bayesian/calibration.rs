@@ -1,6 +1,9 @@
 use std::collections::VecDeque;
+use std::path::Path;
 
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use tracing::info;
 
 /// Calibration tracker using Brier score and log-loss.
 ///
@@ -14,7 +17,7 @@ pub struct CalibrationTracker {
     max_history: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CalibrationEntry {
     pub timestamp: DateTime<Utc>,
     pub predicted_prob: f64,
@@ -111,6 +114,51 @@ impl CalibrationTracker {
     /// Returns a default moderate uncertainty if not enough data.
     pub fn model_uncertainty(&self) -> f64 {
         self.report().map(|r| r.model_uncertainty).unwrap_or(0.3) // Default: moderate uncertainty when uncalibrated
+    }
+
+    /// Get model uncertainty with warmup awareness.
+    /// Returns a low default when fewer than `min_samples` settled outcomes exist,
+    /// allowing trades to flow through the Kelly gate while calibration data accumulates.
+    pub fn model_uncertainty_warmup(&self, min_samples: usize) -> f64 {
+        if self.history.len() < min_samples {
+            return 0.15; // Optimistic default during warmup
+        }
+        self.report().map(|r| r.model_uncertainty).unwrap_or(0.15)
+    }
+
+    /// Save calibration history to a JSON file.
+    pub fn save(&self, path: &Path) -> anyhow::Result<()> {
+        let entries: Vec<&CalibrationEntry> = self.history.iter().collect();
+        let json = serde_json::to_string_pretty(&entries)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, json)?;
+        Ok(())
+    }
+
+    /// Load calibration history from a JSON file.
+    /// Returns a new tracker populated with the persisted entries.
+    pub fn load(path: &Path, max_history: usize) -> anyhow::Result<Self> {
+        let data = std::fs::read_to_string(path)?;
+        let entries: Vec<CalibrationEntry> = serde_json::from_str(&data)?;
+        let len = entries.len();
+        let mut history = VecDeque::with_capacity(max_history);
+        // If persisted data exceeds max_history, keep only the most recent entries.
+        let skip = len.saturating_sub(max_history);
+        for entry in entries.into_iter().skip(skip) {
+            history.push_back(entry);
+        }
+        info!(
+            path = %path.display(),
+            loaded_samples = len,
+            retained = history.len(),
+            "loaded calibration history"
+        );
+        Ok(Self {
+            history,
+            max_history,
+        })
     }
 
     /// Check if calibration has degraded beyond acceptable threshold.
@@ -237,6 +285,71 @@ mod tests {
             tracker.record(0.5, true, "test".into());
         }
         assert_eq!(tracker.sample_count(), 5);
+    }
+
+    #[test]
+    fn test_warmup_returns_low_default() {
+        let mut tracker = CalibrationTracker::new(100);
+        // With < 30 samples, warmup should return 0.15
+        for _ in 0..10 {
+            tracker.record(0.5, true, "test".into());
+        }
+        assert_eq!(tracker.model_uncertainty_warmup(30), 0.15);
+    }
+
+    #[test]
+    fn test_warmup_uses_real_uncertainty_after_threshold() {
+        let mut tracker = CalibrationTracker::new(100);
+        // Perfect predictions — real uncertainty should be very low
+        for _ in 0..30 {
+            tracker.record(0.95, true, "test".into());
+            tracker.record(0.05, false, "test".into());
+        }
+        let warmup_val = tracker.model_uncertainty_warmup(30);
+        // Should use real Brier-based value, not the warmup default
+        assert!(warmup_val < 0.1, "expected real uncertainty < 0.1, got {warmup_val}");
+    }
+
+    #[test]
+    fn test_save_and_load_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test_cal.json");
+
+        let mut tracker = CalibrationTracker::new(100);
+        for i in 0..10 {
+            tracker.record(0.5 + (i as f64 * 0.03), i % 2 == 0, format!("q{i}"));
+        }
+
+        tracker.save(&path).unwrap();
+        let loaded = CalibrationTracker::load(&path, 100).unwrap();
+        assert_eq!(loaded.sample_count(), 10);
+
+        // Brier scores should match
+        let orig_report = tracker.report().unwrap();
+        let loaded_report = loaded.report().unwrap();
+        assert!((orig_report.brier_score - loaded_report.brier_score).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_load_respects_max_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test_cal.json");
+
+        let mut tracker = CalibrationTracker::new(100);
+        for i in 0..50 {
+            tracker.record(0.5, i % 2 == 0, "test".into());
+        }
+        tracker.save(&path).unwrap();
+
+        // Load with smaller max_history — should keep only the most recent 20
+        let loaded = CalibrationTracker::load(&path, 20).unwrap();
+        assert_eq!(loaded.sample_count(), 20);
+    }
+
+    #[test]
+    fn test_load_missing_file_returns_error() {
+        let result = CalibrationTracker::load(Path::new("/nonexistent/path.json"), 100);
+        assert!(result.is_err());
     }
 
     #[test]

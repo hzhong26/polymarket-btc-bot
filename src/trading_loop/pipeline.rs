@@ -40,6 +40,9 @@ pub struct PipelineDiagnostics {
     pub time_to_expiry_secs: f64,
     pub p_model: Option<f64>,
     pub model_volatility: Option<f64>,
+    pub ewma_variance: Option<f64>,
+    pub ewma_observations: Option<usize>,
+    pub ewma_warmed_up: Option<bool>,
     pub model_type: &'static str,
     pub market_implied_p: Option<f64>,
     pub posterior: Option<f64>,
@@ -58,6 +61,7 @@ pub struct PipelineDiagnostics {
     pub kelly_final: Option<f64>,
     pub kelly_stake_usdc: Option<Decimal>,
     pub kelly_size_tokens: Option<Decimal>,
+    pub fee_asymmetry_flip: Option<bool>,
 }
 
 /// What action (if any) should be taken for this market.
@@ -108,6 +112,7 @@ fn populate_edge_diagnostics(diagnostics: &mut PipelineDiagnostics, edge_result:
     diagnostics.cost_latency = edge_result.trading_cost.latency_penalty.to_f64();
     diagnostics.cost_total = edge_result.trading_cost.total.to_f64();
     diagnostics.net_edge = Some(edge_result.net_edge);
+    diagnostics.fee_asymmetry_flip = Some(edge_result.fee_asymmetry_flip);
 }
 
 /// Evaluate a single market against current price data.
@@ -138,6 +143,8 @@ pub fn evaluate_market(
     max_spread_ratio: f64,
     min_liquidity: f64,
     min_time_to_expiry_secs: i64,
+    max_net_edge: Option<f64>,
+    yes_edge_threshold_mult: f64,
 ) -> PipelineResult {
     let market_asset = PriceAsset::from_market_question(&market.question);
     let aggregated_spot = price.spot_usd.to_f64();
@@ -158,6 +165,9 @@ pub fn evaluate_market(
         time_to_expiry_secs: (market.end_time - Utc::now()).num_seconds() as f64,
         p_model: None,
         model_volatility: None,
+        ewma_variance: None,
+        ewma_observations: None,
+        ewma_warmed_up: None,
         model_type: if market.strike_price > Decimal::ZERO {
             "strike_gbm"
         } else {
@@ -180,6 +190,7 @@ pub fn evaluate_market(
         kelly_final: None,
         kelly_stake_usdc: None,
         kelly_size_tokens: None,
+        fee_asymmetry_flip: None,
     };
 
     if let Some(asset) = market_asset {
@@ -231,6 +242,9 @@ pub fn evaluate_market(
     diagnostics.market_implied_p = Some(posterior_details.market_implied);
     diagnostics.posterior = Some(posterior_details.adjusted_posterior);
     diagnostics.time_to_expiry_secs = posterior_details.time_to_expiry_secs;
+    diagnostics.ewma_variance = bayesian.ewma_variance();
+    diagnostics.ewma_observations = Some(bayesian.ewma_total_observations());
+    diagnostics.ewma_warmed_up = Some(bayesian.ewma_warmed_up());
 
     let confidence = diagnostics.confidence_score;
     let spread = diagnostics.spread_ratio.unwrap_or(f64::INFINITY);
@@ -414,8 +428,14 @@ pub fn evaluate_market(
     diagnostics.kelly_size_tokens = Some(position.size_tokens);
 
     // Step 6: threshold check using dynamic effective threshold.
-    diagnostics.threshold_pass = Some(edge_result.net_edge >= effective_threshold);
-    if edge_result.net_edge < effective_threshold {
+    // Apply YES-side multiplier so YES trades need more edge to pass.
+    let side_threshold = match edge_result.side {
+        EdgeSide::BuyYes => effective_threshold * yes_edge_threshold_mult,
+        EdgeSide::BuyNo => effective_threshold,
+    };
+    diagnostics.edge_threshold = side_threshold;
+    diagnostics.threshold_pass = Some(edge_result.net_edge >= side_threshold);
+    if edge_result.net_edge < side_threshold {
         let net_edge = edge_result.net_edge;
         return PipelineResult {
             market: market.clone(),
@@ -424,11 +444,30 @@ pub fn evaluate_market(
             diagnostics,
             action: PipelineAction::NoTrade {
                 reason: format!(
-                    "net edge {:.4} below effective threshold {:.4}",
-                    net_edge, effective_threshold
+                    "net edge {:.4} below effective threshold {:.4} (side_mult={:.2})",
+                    net_edge, side_threshold, yes_edge_threshold_mult
                 ),
             },
         };
+    }
+
+    // Max net edge cap — reject suspiciously large edges.
+    if let Some(cap) = max_net_edge {
+        if edge_result.net_edge > cap {
+            let net_edge = edge_result.net_edge;
+            return PipelineResult {
+                market: market.clone(),
+                edge_result: Some(edge_result),
+                position: Some(position),
+                diagnostics,
+                action: PipelineAction::NoTrade {
+                    reason: format!(
+                        "net edge {:.4} above max cap {:.4}",
+                        net_edge, cap
+                    ),
+                },
+            };
+        }
     }
 
     // Step 7: Risk check in USDC stake units.

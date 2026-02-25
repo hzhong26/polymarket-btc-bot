@@ -5,7 +5,7 @@ use rust_decimal::Decimal;
 
 use crate::venue::{OrderBook, Side};
 
-pub use fees::{FeeModel, TradingCost};
+pub use fees::{FeeModel, FeeRegime, TradingCost};
 
 #[derive(Debug, thiserror::Error)]
 pub enum EdgeError {
@@ -30,6 +30,8 @@ pub struct EdgeResult {
     pub trading_cost: TradingCost,
     /// Which side the edge favors
     pub side: EdgeSide,
+    /// Whether fee asymmetry flipped the side vs what gross edge would have chosen
+    pub fee_asymmetry_flip: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -42,7 +44,9 @@ pub enum EdgeSide {
 
 /// Calculate the executable edge for a market.
 ///
-/// net_edge = posterior - executable_price - taker_fee - slippage - latency_penalty
+/// Computes net edge (gross - costs) for **both** sides and picks the winner.
+/// This accounts for fee asymmetry: Polymarket's dynamic fee formula is price-dependent,
+/// so the cheaper-fee side can win even with slightly lower gross edge.
 ///
 /// Uses side-aware book prices (best ask for buys, best bid for sells), NOT midpoint.
 pub fn calculate_edge(
@@ -51,43 +55,54 @@ pub fn calculate_edge(
     fee_model: &FeeModel,
     order_size: Decimal,
 ) -> Result<EdgeResult, EdgeError> {
-    // Determine which side has edge
     let yes_ask = book.best_ask().and_then(|p| p.to_f64()).unwrap_or(1.0);
     let no_bid = book.best_bid().and_then(|p| p.to_f64()).unwrap_or(0.0);
 
-    // Edge on Yes side: model says Yes is worth `posterior`, market asks `yes_ask`
+    // Gross edge on each side
     let yes_gross_edge = posterior - yes_ask;
+    let no_gross_edge = (1.0 - posterior) - (1.0 - no_bid); // = no_bid - posterior
 
-    // Edge on No side: model says No is worth `1 - posterior`, market asks `1 - no_bid`
-    // Equivalently: buying No is profitable when the market overprices Yes
-    let no_gross_edge = (1.0 - posterior) - (1.0 - no_bid);
+    // Compute net edge for each side that has an executable price
+    let yes_exec = FeeModel::executable_price(book, Side::Buy);
+    let no_exec = FeeModel::executable_price(book, Side::Sell);
 
-    // Pick the side with more edge
-    let (side, gross_edge, executable_price_decimal) = if yes_gross_edge > no_gross_edge {
-        (
-            EdgeSide::BuyYes,
-            yes_gross_edge,
-            FeeModel::executable_price(book, Side::Buy)
-                .ok_or(EdgeError::NoExecutablePrice(Side::Buy))?,
-        )
-    } else {
-        (
-            EdgeSide::BuyNo,
-            no_gross_edge,
-            FeeModel::executable_price(book, Side::Sell)
-                .ok_or(EdgeError::NoExecutablePrice(Side::Sell))?,
-        )
-    };
+    let yes_net = yes_exec.map(|exec_price| {
+        let cost = fee_model.total_cost(book, Side::Buy, order_size, exec_price);
+        let cost_f64 = cost.total.to_f64().unwrap_or(0.0);
+        (yes_gross_edge, yes_gross_edge - cost_f64, exec_price, cost)
+    });
 
-    let book_side = match side {
-        EdgeSide::BuyYes => Side::Buy,
-        EdgeSide::BuyNo => Side::Sell,
-    };
+    let no_net = no_exec.map(|exec_price| {
+        let cost = fee_model.total_cost(book, Side::Sell, order_size, exec_price);
+        let cost_f64 = cost.total.to_f64().unwrap_or(0.0);
+        (no_gross_edge, no_gross_edge - cost_f64, exec_price, cost)
+    });
 
-    let trading_cost = fee_model.total_cost(book, book_side, order_size);
-    let cost_f64 = trading_cost.total.to_f64().unwrap_or(0.0);
-    let net_edge = gross_edge - cost_f64;
-    let executable_price = executable_price_decimal.to_f64().unwrap_or(0.5);
+    // Pick the side with higher net edge, falling back if one side has no executable price
+    let (side, gross_edge, net_edge, exec_price, trading_cost, fee_asymmetry_flip) =
+        match (yes_net, no_net) {
+            (Some((y_gross, y_net, y_exec, y_cost)), Some((n_gross, n_net, n_exec, n_cost))) => {
+                let gross_would_pick_yes = y_gross > n_gross;
+                if y_net >= n_net {
+                    let flip = !gross_would_pick_yes;
+                    (EdgeSide::BuyYes, y_gross, y_net, y_exec, y_cost, flip)
+                } else {
+                    let flip = gross_would_pick_yes;
+                    (EdgeSide::BuyNo, n_gross, n_net, n_exec, n_cost, flip)
+                }
+            }
+            (Some((y_gross, y_net, y_exec, y_cost)), None) => {
+                (EdgeSide::BuyYes, y_gross, y_net, y_exec, y_cost, false)
+            }
+            (None, Some((n_gross, n_net, n_exec, n_cost))) => {
+                (EdgeSide::BuyNo, n_gross, n_net, n_exec, n_cost, false)
+            }
+            (None, None) => {
+                return Err(EdgeError::NoExecutablePrice(Side::Buy));
+            }
+        };
+
+    let executable_price = exec_price.to_f64().unwrap_or(0.5);
 
     Ok(EdgeResult {
         posterior,
@@ -96,6 +111,7 @@ pub fn calculate_edge(
         gross_edge,
         trading_cost,
         side,
+        fee_asymmetry_flip,
     })
 }
 
@@ -169,5 +185,46 @@ mod tests {
         let result = calculate_edge(0.60, &book, &fee_model, Decimal::from(100)).unwrap();
         assert_eq!(result.side, EdgeSide::BuyNo);
         assert!(result.gross_edge > 0.0);
+    }
+
+    #[test]
+    fn test_fee_asymmetry_flips_side() {
+        // Dynamic fees are highly price-dependent:
+        //   at p=0.50: fee = 0.25 × (0.50×0.50)^2 = 0.015625
+        //   at p=0.90: fee = 0.25 × (0.90×0.10)^2 = 0.002025
+        //
+        // Construct a book where ask=0.50 (expensive fee zone) and bid=0.90 (cheap fee zone).
+        // With posterior=0.705:
+        //   BuyYes gross = 0.705 - 0.50 = 0.205  (higher)
+        //   BuyNo  gross = 0.90 - 0.705 = 0.195  (lower)
+        //   → Gross edge picks BuyYes
+        //
+        //   BuyYes net = 0.205 - 0.015625 - 0.005 ≈ 0.1844
+        //   BuyNo  net = 0.195 - 0.002025 - 0.005 ≈ 0.1880
+        //   → Net edge picks BuyNo (fee asymmetry flip!)
+        let book = make_book(0.90, 0.50);
+        let fee_model = FeeModel::with_dynamic(
+            Decimal::new(25, 2), // 0.25 fee_rate
+            2,                   // exponent
+            Decimal::new(5, 3),  // 0.005 latency penalty
+        );
+
+        let result = calculate_edge(0.705, &book, &fee_model, Decimal::ONE).unwrap();
+
+        // Net edge should pick BuyNo despite BuyYes having higher gross
+        assert_eq!(result.side, EdgeSide::BuyNo);
+        assert!(result.fee_asymmetry_flip, "should report a fee asymmetry flip");
+        assert!(result.net_edge > 0.0, "BuyNo net edge should be positive");
+    }
+
+    #[test]
+    fn test_no_flip_with_flat_fees() {
+        // With flat fees, both sides pay the same fee, so no asymmetry flip possible
+        let book = make_book(0.50, 0.55);
+        let fee_model = make_fee_model();
+
+        let result = calculate_edge(0.70, &book, &fee_model, Decimal::from(100)).unwrap();
+        assert_eq!(result.side, EdgeSide::BuyYes);
+        assert!(!result.fee_asymmetry_flip);
     }
 }

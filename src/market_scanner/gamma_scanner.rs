@@ -302,7 +302,14 @@ mod tests {
             paper_bankroll_usdc: Decimal::from(1000),
             dashboard_enabled: true,
             dashboard_live_interval_ms: 5_000,
+            calibration_min_samples: 30,
+            vol_window_secs: 300,
+            ewma_lambda: 0.94,
+            fee_rate: Decimal::new(25, 2),
+            fee_exponent: 2,
             asset_params: Default::default(),
+            max_net_edge: None,
+            yes_edge_threshold_mult: Decimal::ONE,
         }
     }
 

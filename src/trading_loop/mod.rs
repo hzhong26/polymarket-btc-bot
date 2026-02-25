@@ -29,7 +29,7 @@ use crate::risk::clock::ClockGuard;
 use crate::risk::kill_switch::KillSwitch;
 use crate::risk::RiskManager;
 use crate::timezone::{et_abbreviation, to_et};
-use crate::venue::{MarketResolution, OrderEvent, Side, VenueClient};
+use crate::venue::{MarketResolution, OrderEvent, Side, VenueClient, VenueError};
 
 use self::reference_cache::{CapturedReference, ReferencePriceCache, ReferenceSource};
 
@@ -52,6 +52,7 @@ type ScanResultMsg = (
     chrono::DateTime<Utc>,
     Result<Vec<TargetMarket>, ScannerError>,
 );
+type SettlementPollMsg = Vec<(String, Result<Option<MarketResolution>, VenueError>)>;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct EligibilitySnapshot {
@@ -93,6 +94,10 @@ pub struct TradingLoop {
     scan_result_tx: tokio::sync::mpsc::Sender<ScanResultMsg>,
     scan_result_rx: tokio::sync::mpsc::Receiver<ScanResultMsg>,
     pending_scan_handle: Option<tokio::task::JoinHandle<()>>,
+    settlement_in_flight: bool,
+    settlement_result_tx: tokio::sync::mpsc::Sender<SettlementPollMsg>,
+    settlement_result_rx: tokio::sync::mpsc::Receiver<SettlementPollMsg>,
+    pending_settlement_handle: Option<tokio::task::JoinHandle<()>>,
     event_logger: EventLoggerHandle,
     last_eligibility_snapshot_by_asset: HashMap<PriceAsset, EligibilitySnapshot>,
     drawdown_halt: Option<String>,
@@ -106,7 +111,7 @@ impl TradingLoop {
         config: TradingConfig,
         price_feed_config: PriceFeedConfig,
         scanner: GammaScanner,
-        bayesian: BayesianUpdater,
+        bayesian_by_asset: HashMap<PriceAsset, BayesianUpdater>,
         kelly: KellySizer,
         executor: OrderManager,
         risk: RiskManager,
@@ -121,20 +126,30 @@ impl TradingLoop {
     ) -> Self {
         let dashboard_enabled = config.dashboard_enabled;
         let dashboard_live_interval = Duration::from_millis(config.dashboard_live_interval_ms);
-        let taker_fee_rate = fee_model.taker_fee_rate;
+        let fee_regime = fee_model.fee_regime;
         let (scan_result_tx, scan_result_rx) = tokio::sync::mpsc::channel(4);
+        let (settlement_result_tx, settlement_result_rx) = tokio::sync::mpsc::channel(4);
 
         Self {
             config,
             price_feed_config,
             scanner,
-            bayesian_by_asset: PriceAsset::ALL
-                .into_iter()
-                .map(|asset| (asset, bayesian.clone()))
-                .collect(),
+            bayesian_by_asset,
             calibration_by_asset: PriceAsset::ALL
                 .into_iter()
-                .map(|asset| (asset, CalibrationTracker::new(500)))
+                .map(|asset| {
+                    let path = std::path::PathBuf::from("logs")
+                        .join(format!("calibration_{}.json", asset.symbol().to_lowercase()));
+                    let tracker = CalibrationTracker::load(&path, 500).unwrap_or_else(|_| {
+                        info!(
+                            asset = %asset,
+                            path = %path.display(),
+                            "no persisted calibration found, starting fresh"
+                        );
+                        CalibrationTracker::new(500)
+                    });
+                    (asset, tracker)
+                })
                 .collect(),
             latest_spot_by_asset: HashMap::new(),
             kelly,
@@ -145,12 +160,15 @@ impl TradingLoop {
             kill_switch,
             active_markets: Vec::new(),
             reference_cache: ReferencePriceCache::new(),
-            http_client: reqwest::Client::new(),
+            http_client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
             last_scan: Utc::now() - chrono::Duration::hours(1), // Force immediate scan
             paper_mode,
             paper_bankroll,
             paper_trader: PaperTrader::new(dashboard_enabled),
-            pnl_tracker: PnlTracker::new(starting_capital, taker_fee_rate),
+            pnl_tracker: PnlTracker::new(starting_capital, fee_regime),
             dashboard_enabled,
             dashboard_live_interval,
             last_pnl_dashboard: Utc::now() - chrono::Duration::hours(1),
@@ -161,8 +179,15 @@ impl TradingLoop {
             scan_result_tx,
             scan_result_rx,
             pending_scan_handle: None,
+            settlement_in_flight: false,
+            settlement_result_tx,
+            settlement_result_rx,
+            pending_settlement_handle: None,
             trade_sheet: event_logger.is_enabled().then(|| {
-                trade_sheet::TradeSheetWriter::new(event_logger.log_dir())
+                trade_sheet::TradeSheetWriter::new(
+                    event_logger.log_dir(),
+                    &event_logger.run_metadata().bot_version,
+                )
             }),
             event_logger,
             last_eligibility_snapshot_by_asset: HashMap::new(),
@@ -330,10 +355,17 @@ impl TradingLoop {
                     self.last_pnl_dashboard = Utc::now();
                 }
 
-                // Branch 5: Periodic settlement
-                _ = tokio::time::sleep(time_until_next_settlement(self.last_settlement_check, SETTLEMENT_CHECK_INTERVAL)) => {
-                    self.run_settlement(venue.as_ref()).await;
-                    self.last_settlement_check = Utc::now();
+                // Branch 5: Dispatch settlement resolution polling (non-blocking)
+                _ = tokio::time::sleep(time_until_next_settlement(self.last_settlement_check, SETTLEMENT_CHECK_INTERVAL)),
+                    if !self.settlement_in_flight => {
+                    self.dispatch_settlement(venue.clone());
+                }
+
+                // Branch 5b: Settlement poll results
+                Some(results) = self.settlement_result_rx.recv() => {
+                    self.settlement_in_flight = false;
+                    self.pending_settlement_handle.take();
+                    self.apply_settlement_results(results);
                 }
 
                 // Branch 6: Periodic strict reference capture probe
@@ -363,6 +395,9 @@ impl TradingLoop {
                     if let Some(handle) = self.pending_scan_handle.take() {
                         handle.abort();
                     }
+                    if let Some(handle) = self.pending_settlement_handle.take() {
+                        handle.abort();
+                    }
                     if !self.paper_mode {
                         if let Err(e) = self.executor.cancel_all(venue.as_ref()).await {
                             error!(error = %e, "failed to cancel all orders on shutdown");
@@ -376,6 +411,9 @@ impl TradingLoop {
             if self.kill_switch.is_triggered() {
                 error!("kill switch active — halting trading loop");
                 if let Some(handle) = self.pending_scan_handle.take() {
+                    handle.abort();
+                }
+                if let Some(handle) = self.pending_settlement_handle.take() {
                     handle.abort();
                 }
                 if !self.paper_mode {
@@ -397,6 +435,9 @@ impl TradingLoop {
                     serde_json::json!({ "reason": reason }),
                 );
                 if let Some(handle) = self.pending_scan_handle.take() {
+                    handle.abort();
+                }
+                if let Some(handle) = self.pending_settlement_handle.take() {
                     handle.abort();
                 }
                 if !self.paper_mode {
@@ -611,10 +652,56 @@ impl TradingLoop {
         }
     }
 
+    /// Fallback: for any up/down market that still lacks a reference price after the
+    /// strict capture window has passed, inject the latest aggregated spot price.
+    /// Less accurate than a capture at market open, but far better than not trading.
+    fn late_capture_from_spot_if_blocked(&mut self) {
+        if !self.price_feed_config.captured_reference_for_entry {
+            return;
+        }
+        for market in &self.active_markets {
+            if market.strike_price > Decimal::ZERO {
+                continue; // strike markets don't need a reference
+            }
+            if market.polymarket_price_to_beat.is_some() {
+                continue; // already has an official reference
+            }
+            let Some(asset) = PriceAsset::from_market_question(&market.question) else {
+                continue;
+            };
+            let Some(start) = market.start_time else {
+                continue;
+            };
+            if self.reference_cache.get(asset, start).is_some() {
+                continue; // already captured
+            }
+            let Some((_, spot)) = self.latest_spot_by_asset.get(&asset) else {
+                continue;
+            };
+            warn!(
+                asset = %asset,
+                window_start_et = %fmt_et_log_time(start),
+                spot = %spot,
+                "late reference capture from aggregated spot (missed capture window)"
+            );
+            self.reference_cache.insert(
+                asset,
+                start,
+                reference_cache::CapturedReference {
+                    price: *spot,
+                    source: reference_cache::ReferenceSource::AggregatedSpot,
+                    captured_at: Utc::now(),
+                    window_start: start,
+                },
+            );
+        }
+    }
+
     async fn handle_price_update(&mut self, venue: &dyn VenueClient, price: &AggregatedPrice) {
         self.latest_spot_by_asset
             .insert(price.asset, (price.timestamp, price.spot_usd));
         self.capture_reference_prices_at(Utc::now()).await;
+        self.late_capture_from_spot_if_blocked();
         self.prune_expired_markets(Utc::now(), "price_update");
         self.maybe_log_eligibility_snapshot(price.asset);
 
@@ -625,8 +712,8 @@ impl TradingLoop {
         let base_uncertainty = self
             .calibration_by_asset
             .get(&price.asset)
-            .map(|c| c.model_uncertainty())
-            .unwrap_or(0.3);
+            .map(|c| c.model_uncertainty_warmup(self.config.calibration_min_samples))
+            .unwrap_or(0.15);
         let model_uncertainty = (base_uncertainty
             * asset_tuning.uncertainty_mult.to_f64().unwrap_or(1.0))
         .clamp(0.0, 1.0);
@@ -766,6 +853,8 @@ impl TradingLoop {
                 self.config.max_spread_ratio.to_f64().unwrap_or(0.01),
                 self.config.min_liquidity.to_f64().unwrap_or(0.0),
                 self.config.min_time_to_expiry_secs as i64,
+                self.config.max_net_edge.and_then(|d| d.to_f64()),
+                self.config.yes_edge_threshold_mult.to_f64().unwrap_or(1.0),
             );
             let is_no_trade = matches!(result.action, PipelineAction::NoTrade { .. });
             let was_sampled = if is_no_trade {
@@ -829,6 +918,7 @@ impl TradingLoop {
                             official_price_to_beat: market.polymarket_price_to_beat,
                             model_type: Some(result.diagnostics.model_type.to_string()),
                             predicted_yes_prob: result.diagnostics.posterior,
+                            model_yes_prob: result.diagnostics.p_model,
                             outcome_side: Some(outcome_side_for_token(market, token_id)),
                         },
                         *order_price,
@@ -996,6 +1086,7 @@ impl TradingLoop {
                                     official_price_to_beat: market.polymarket_price_to_beat,
                                     model_type: Some(result.diagnostics.model_type.to_string()),
                                     predicted_yes_prob: result.diagnostics.posterior,
+                                    model_yes_prob: result.diagnostics.p_model,
                                     outcome_side: Some(outcome_side_for_token(market, token_id)),
                                 },
                             );
@@ -1168,32 +1259,99 @@ impl TradingLoop {
         );
     }
 
-    async fn run_settlement(&mut self, venue: &dyn VenueClient) {
+    /// In paper mode, resolve an Up/Down market using our own spot price data
+    /// instead of waiting for Polymarket's Gamma API (which can lag ~10-12 min).
+    /// Returns `Some(MarketResolution)` when we have enough data to self-resolve.
+    fn try_self_resolve_updown(&self, condition_id: &str) -> Option<MarketResolution> {
+        let (asset, window_start) = self.pnl_tracker.asset_and_window(condition_id)?;
+
+        // Get the reference (open) price — prefer official, fall back to our captured
+        let reference = self
+            .pnl_tracker
+            .position_reference_price(condition_id)
+            .or_else(|| self.reference_cache.get(asset, window_start).map(|c| c.price))?;
+
+        // Get current spot price for the asset
+        let (_, spot) = self.latest_spot_by_asset.get(&asset)?;
+
+        // Up/Down resolution: YES wins if price went up
+        let yes_won = *spot > reference;
+
+        info!(
+            condition_id = %condition_id,
+            asset = %asset,
+            reference = %reference,
+            spot = %spot,
+            yes_won,
+            "paper-mode self-resolution from spot price"
+        );
+
+        Some(MarketResolution {
+            condition_id: condition_id.to_string(),
+            resolved_yes_outcome: Some(yes_won),
+            official_final_price: Some(*spot),
+            official_price_to_beat: Some(reference),
+            resolved_at: Some(Utc::now()),
+            resolution_source: "self_resolve_spot".to_string(),
+        })
+    }
+
+    /// Dispatch settlement resolution polling to a background task.
+    /// Only the Gamma API network calls are spawned; everything else stays in the main loop.
+    fn dispatch_settlement(&mut self, venue: Arc<dyn VenueClient>) {
+        if self.settlement_in_flight {
+            return;
+        }
+
         let now = Utc::now();
-        let due_condition_ids = self
+        let due = self
             .pnl_tracker
             .due_condition_ids(now, SETTLEMENT_GRACE_SECS);
+
+        // Filter by backoff — only poll conditions whose backoff has expired
+        let to_poll: Vec<String> = due
+            .into_iter()
+            .filter(|cid| {
+                !self
+                    .resolution_poll_not_before
+                    .get(cid)
+                    .is_some_and(|next| now < *next)
+            })
+            .collect();
+
+        if to_poll.is_empty() {
+            return;
+        }
+
+        self.settlement_in_flight = true;
+        self.last_settlement_check = now;
+
+        let tx = self.settlement_result_tx.clone();
+        self.pending_settlement_handle = Some(tokio::spawn(async move {
+            let mut results = Vec::new();
+            for cid in to_poll {
+                let result = venue.get_market_resolution(&cid).await;
+                results.push((cid, result));
+            }
+            if tx.send(results).await.is_err() {
+                debug!("settlement poll result dropped: receiver closed");
+            }
+        }));
+    }
+
+    /// Process the pre-fetched settlement poll results in the main loop.
+    fn apply_settlement_results(&mut self, poll_results: SettlementPollMsg) {
+        let now = Utc::now();
         let mut resolutions_by_condition: HashMap<String, MarketResolution> = HashMap::new();
 
-        for condition_id in due_condition_ids {
-            if self
-                .resolution_poll_not_before
-                .get(&condition_id)
-                .is_some_and(|next| now < *next)
-            {
-                continue;
-            }
-
-            // Resolve via Gamma API (official Polymarket outcome).
-            // The former CLOB mark-price fast path was removed because post-resolution
-            // order books become one-sided (losing token bids vanish, stale asks remain),
-            // causing derive_yes_mark to read the stale ask as a high mark and
-            // incorrectly conclude YES won every time.
-            match venue.get_market_resolution(&condition_id).await {
-                Ok(Some(resolution)) => {
+        for (condition_id, result) in poll_results {
+            match result {
+                Ok(Some(mut resolution)) => {
                     // Post-hoc validation: compare captured reference to official price_to_beat
                     if let Some(official) = resolution.official_price_to_beat {
-                        if let Some((asset, window_start)) = self.pnl_tracker.asset_and_window(&condition_id) {
+                        if let Some((asset, window_start)) =
+                            self.pnl_tracker.asset_and_window(&condition_id)
+                        {
                             if let Some(captured) = self.reference_cache.get(asset, window_start) {
                                 let drift = (captured.price - official).abs();
                                 let drift_pct = if official > Decimal::ZERO {
@@ -1215,6 +1373,31 @@ impl TradingLoop {
 
                     if resolution.resolved_yes_outcome.is_some() {
                         self.resolution_poll_not_before.remove(&condition_id);
+                    } else if self.paper_mode {
+                        // Paper mode fast path: Gamma hasn't resolved yet, use our own
+                        // spot price to determine the outcome immediately.
+                        if let Some(self_resolution) =
+                            self.try_self_resolve_updown(&condition_id)
+                        {
+                            resolution.resolved_yes_outcome =
+                                self_resolution.resolved_yes_outcome;
+                            resolution.official_final_price =
+                                self_resolution.official_final_price;
+                            resolution.resolution_source =
+                                self_resolution.resolution_source;
+                            resolution.resolved_at = self_resolution.resolved_at;
+                            // Keep official_price_to_beat from Gamma if available
+                            if resolution.official_price_to_beat.is_none() {
+                                resolution.official_price_to_beat =
+                                    self_resolution.official_price_to_beat;
+                            }
+                            self.resolution_poll_not_before.remove(&condition_id);
+                        } else {
+                            self.resolution_poll_not_before.insert(
+                                condition_id.clone(),
+                                now + chrono::Duration::seconds(RESOLUTION_POLL_INTERVAL_SECS),
+                            );
+                        }
                     } else {
                         info!(
                             condition_id = %condition_id,
@@ -1226,27 +1409,49 @@ impl TradingLoop {
                             now + chrono::Duration::seconds(RESOLUTION_POLL_INTERVAL_SECS),
                         );
                     }
-                    resolutions_by_condition.insert(condition_id.clone(), resolution);
+                    resolutions_by_condition.insert(condition_id, resolution);
                 }
                 Ok(None) => {
+                    // Market not found on Gamma yet.  In paper mode, self-resolve
+                    // immediately from our own spot price data.
+                    if self.paper_mode {
+                        if let Some(resolution) = self.try_self_resolve_updown(&condition_id) {
+                            self.resolution_poll_not_before.remove(&condition_id);
+                            resolutions_by_condition.insert(condition_id, resolution);
+                            continue;
+                        }
+                    }
                     info!(
                         condition_id = %condition_id,
                         now_et = %fmt_et_log_time(now),
                         "resolution pending after expiry; market not yet found on closed pages"
                     );
                     self.resolution_poll_not_before.insert(
-                        condition_id.clone(),
+                        condition_id,
                         now + chrono::Duration::seconds(RESOLUTION_POLL_INTERVAL_SECS),
                     );
                 }
                 Err(e) => {
+                    // API error.  In paper mode, self-resolve to avoid blocking.
+                    if self.paper_mode {
+                        if let Some(resolution) = self.try_self_resolve_updown(&condition_id) {
+                            self.resolution_poll_not_before.remove(&condition_id);
+                            resolutions_by_condition.insert(condition_id.clone(), resolution);
+                            warn!(
+                                condition_id = %condition_id,
+                                error = %e,
+                                "Gamma API failed, used paper-mode self-resolution"
+                            );
+                            continue;
+                        }
+                    }
                     warn!(
                         condition_id = %condition_id,
                         error = %e,
                         "failed to fetch official market resolution"
                     );
                     self.resolution_poll_not_before.insert(
-                        condition_id.clone(),
+                        condition_id,
                         now + chrono::Duration::seconds(RESOLUTION_POLL_INTERVAL_SECS),
                     );
                 }
@@ -1266,10 +1471,19 @@ impl TradingLoop {
         for rec in &settled {
             if let Some(cal) = self.calibration_by_asset.get_mut(&rec.asset) {
                 cal.record(
-                    rec.predicted_yes_prob,
+                    rec.model_yes_prob,
                     rec.actual_yes_outcome,
                     rec.market_question.clone(),
                 );
+                let path = std::path::PathBuf::from("logs")
+                    .join(format!("calibration_{}.json", rec.asset.symbol().to_lowercase()));
+                if let Err(e) = cal.save(&path) {
+                    warn!(
+                        asset = %rec.asset,
+                        error = %e,
+                        "failed to persist calibration history"
+                    );
+                }
             }
             let trade_payload = closed_trade_payload(rec);
             self.event_logger
@@ -1312,7 +1526,8 @@ impl TradingLoop {
                 &snap_payload,
                 self.pnl_tracker.open_position_cards(),
             );
-            self.event_logger.try_log_value("pnl_snapshot", snap_payload);
+            self.event_logger
+                .try_log_value("pnl_snapshot", snap_payload);
         }
     }
 

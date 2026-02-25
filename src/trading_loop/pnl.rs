@@ -5,6 +5,7 @@ use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde_json::Value;
 
+use crate::edge::FeeRegime;
 use crate::market_scanner::TargetMarket;
 use crate::price_feeds::PriceAsset;
 use crate::venue::{MarketResolution, OrderBook, Side};
@@ -29,6 +30,7 @@ pub struct FillContext {
     pub official_price_to_beat: Option<Decimal>,
     pub model_type: Option<String>,
     pub predicted_yes_prob: Option<f64>,
+    pub model_yes_prob: Option<f64>,
     pub outcome_side: Option<OutcomeTokenSide>,
 }
 
@@ -48,6 +50,7 @@ pub struct PositionState {
     pub official_price_to_beat: Option<Decimal>,
     pub model_type: String,
     pub predicted_yes_prob_avg: f64,
+    pub model_yes_prob_avg: f64,
     pub opened_at: DateTime<Utc>,
     pub entry_side: Side,
     pub outcome_side: OutcomeTokenSide,
@@ -67,6 +70,7 @@ pub struct ClosedTradeRecord {
     pub avg_entry_price: Decimal,
     pub quantity: Decimal,
     pub predicted_yes_prob: f64,
+    pub model_yes_prob: f64,
     pub actual_yes_outcome: bool,
     pub payout_price: Decimal,
     pub realized_pnl: Decimal,
@@ -119,7 +123,7 @@ pub struct PnlTracker {
     starting_capital: Decimal,
     realized_pnl: Decimal,
     total_fees_paid: Decimal,
-    taker_fee_rate: Decimal,
+    fee_regime: FeeRegime,
     positions: HashMap<String, PositionState>,
     order_context: HashMap<String, FillContext>,
     settled_condition_ids: HashSet<String>,
@@ -132,12 +136,12 @@ pub struct PnlTracker {
 }
 
 impl PnlTracker {
-    pub fn new(starting_capital: Decimal, taker_fee_rate: Decimal) -> Self {
+    pub fn new(starting_capital: Decimal, fee_regime: FeeRegime) -> Self {
         Self {
             starting_capital,
             realized_pnl: Decimal::ZERO,
             total_fees_paid: Decimal::ZERO,
-            taker_fee_rate: taker_fee_rate.max(Decimal::ZERO),
+            fee_regime,
             positions: HashMap::new(),
             order_context: HashMap::new(),
             settled_condition_ids: HashSet::new(),
@@ -283,6 +287,20 @@ impl PnlTracker {
         })
     }
 
+    /// Look up the reference (open) price stored on a position by condition_id.
+    /// Prefers `official_price_to_beat`, falls back to `reference_price`.
+    pub fn position_reference_price(&self, condition_id: &str) -> Option<Decimal> {
+        let cond = normalize_condition_id(condition_id)?;
+        self.positions.values().find_map(|pos| {
+            let pos_cond = pos.condition_id.as_deref().and_then(normalize_condition_id)?;
+            if pos_cond == cond {
+                pos.official_price_to_beat.or(pos.reference_price)
+            } else {
+                None
+            }
+        })
+    }
+
     /// Returns the set of normalized condition IDs that have open (unsettled) positions.
     pub fn open_condition_ids(&self) -> HashSet<String> {
         self.positions
@@ -401,6 +419,7 @@ impl PnlTracker {
                 avg_entry_price: position.avg_entry_price,
                 quantity: position.quantity,
                 predicted_yes_prob: position.predicted_yes_prob_avg,
+                model_yes_prob: position.model_yes_prob_avg,
                 actual_yes_outcome: actual_yes,
                 payout_price: payout,
                 realized_pnl: realized,
@@ -559,12 +578,17 @@ impl PnlTracker {
 
         match context.side {
             Side::Buy => {
-                let fee = fill_price * fill_amount * self.taker_fee_rate;
+                let fee_per_share = self.fee_regime.fee_per_share(fill_price);
+                let fee = fill_amount * fee_per_share;
                 let now = Utc::now();
                 let outcome_side = context.outcome_side.unwrap_or(OutcomeTokenSide::Yes);
                 let mut predicted_prob = context
                     .predicted_yes_prob
                     .unwrap_or(0.5)
+                    .clamp(0.001, 0.999);
+                let mut model_prob = context
+                    .model_yes_prob
+                    .unwrap_or(predicted_prob)
                     .clamp(0.001, 0.999);
 
                 let pos = self
@@ -588,6 +612,7 @@ impl PnlTracker {
                             .clone()
                             .unwrap_or_else(|| "unknown".to_string()),
                         predicted_yes_prob_avg: predicted_prob,
+                        model_yes_prob_avg: model_prob,
                         opened_at: now,
                         entry_side: context.side,
                         outcome_side,
@@ -624,11 +649,20 @@ impl PnlTracker {
                 if context.predicted_yes_prob.is_none() {
                     predicted_prob = pos.predicted_yes_prob_avg;
                 }
+                if context.model_yes_prob.is_none() {
+                    model_prob = pos.model_yes_prob_avg;
+                }
                 let weighted_prob = if (prev_qty_f64 + fill_qty_f64) > 0.0 {
                     ((pos.predicted_yes_prob_avg * prev_qty_f64) + (predicted_prob * fill_qty_f64))
                         / (prev_qty_f64 + fill_qty_f64)
                 } else {
                     pos.predicted_yes_prob_avg
+                };
+                let weighted_model_prob = if (prev_qty_f64 + fill_qty_f64) > 0.0 {
+                    ((pos.model_yes_prob_avg * prev_qty_f64) + (model_prob * fill_qty_f64))
+                        / (prev_qty_f64 + fill_qty_f64)
+                } else {
+                    pos.model_yes_prob_avg
                 };
 
                 pos.quantity = new_qty;
@@ -639,6 +673,7 @@ impl PnlTracker {
                 };
                 pos.last_mark_price = fill_price;
                 pos.predicted_yes_prob_avg = weighted_prob.clamp(0.001, 0.999);
+                pos.model_yes_prob_avg = weighted_model_prob.clamp(0.001, 0.999);
                 self.total_fees_paid += fee;
             }
             Side::Sell => {
@@ -650,7 +685,8 @@ impl PnlTracker {
                     return;
                 }
 
-                let fee = fill_price * close_qty * self.taker_fee_rate;
+                let fee_per_share = self.fee_regime.fee_per_share(fill_price);
+                let fee = close_qty * fee_per_share;
                 let realized = (fill_price - pos.avg_entry_price) * close_qty - fee;
                 self.realized_pnl += realized;
                 *self
@@ -709,6 +745,7 @@ mod tests {
     use super::*;
     use chrono::Utc;
 
+    use crate::edge::FeeRegime;
     use crate::market_scanner::TargetMarket;
     use crate::venue::OrderBookLevel;
 
@@ -726,6 +763,7 @@ mod tests {
             official_price_to_beat: Some(Decimal::new(100, 0)),
             model_type: Some("strike_gbm".to_string()),
             predicted_yes_prob: Some(0.62),
+            model_yes_prob: Some(0.60),
             outcome_side: Some(outcome_side),
         }
     }
@@ -748,6 +786,7 @@ mod tests {
             official_price_to_beat: Some(Decimal::new(1500, 0)),
             model_type: Some("updown_directional".to_string()),
             predicted_yes_prob: Some(0.58),
+            model_yes_prob: Some(0.55),
             outcome_side: Some(outcome_side),
         }
     }
@@ -813,7 +852,7 @@ mod tests {
 
     #[test]
     fn simulated_buy_fill_updates_position_and_fees() {
-        let mut tracker = PnlTracker::new(Decimal::from(1000), Decimal::new(2, 2)); // 2%
+        let mut tracker = PnlTracker::new(Decimal::from(1000), FeeRegime::Flat { rate: Decimal::new(2, 2) }); // 2%
         tracker.apply_simulated_fill(
             ctx("yes-token", PriceAsset::Btc, OutcomeTokenSide::Yes),
             Decimal::new(50, 2),
@@ -822,15 +861,16 @@ mod tests {
 
         let pos = tracker.positions.get("yes-token").unwrap();
         assert_eq!(pos.quantity, Decimal::from(100));
-        assert_eq!(pos.avg_entry_price.round_dp(4), Decimal::new(5100, 4)); // 0.5100
-        assert_eq!(tracker.total_fees_paid.round_dp(2), Decimal::ONE);
+        // fee = 100 × 0.02 = 2.0; avg_entry = (0.50 × 100 + 2.0) / 100 = 0.52
+        assert_eq!(pos.avg_entry_price.round_dp(4), Decimal::new(5200, 4)); // 0.5200
+        assert_eq!(tracker.total_fees_paid.round_dp(2), Decimal::new(2, 0));
         assert_eq!(tracker.trades, 1);
         assert_eq!(tracker.fills, 1);
     }
 
     #[test]
     fn weighted_average_entry_with_multiple_fills() {
-        let mut tracker = PnlTracker::new(Decimal::from(1000), Decimal::new(2, 2)); // 2%
+        let mut tracker = PnlTracker::new(Decimal::from(1000), FeeRegime::Flat { rate: Decimal::new(2, 2) }); // 2%
         tracker.apply_simulated_fill(
             ctx("yes-token", PriceAsset::Eth, OutcomeTokenSide::Yes),
             Decimal::new(50, 2),
@@ -844,12 +884,14 @@ mod tests {
 
         let pos = tracker.positions.get("yes-token").unwrap();
         assert_eq!(pos.quantity, Decimal::from(200));
-        assert_eq!(pos.avg_entry_price.round_dp(4), Decimal::new(5610, 4)); // 0.5610
+        // fee1 = 100 × 0.02 = 2.0; fee2 = 100 × 0.02 = 2.0
+        // total_cost = (50 + 2) + (60 + 2) = 114; avg = 114/200 = 0.5700
+        assert_eq!(pos.avg_entry_price.round_dp(4), Decimal::new(5700, 4)); // 0.5700
     }
 
     #[test]
     fn yes_no_mark_propagation_updates_both_tokens() {
-        let mut tracker = PnlTracker::new(Decimal::from(1000), Decimal::new(2, 2));
+        let mut tracker = PnlTracker::new(Decimal::from(1000), FeeRegime::Flat { rate: Decimal::new(2, 2) });
         tracker.apply_simulated_fill(
             ctx("yes-token", PriceAsset::Xrp, OutcomeTokenSide::Yes),
             Decimal::new(45, 2),
@@ -877,7 +919,7 @@ mod tests {
 
     #[test]
     fn unrealized_pnl_positive_and_negative() {
-        let mut tracker = PnlTracker::new(Decimal::from(1000), Decimal::new(2, 2));
+        let mut tracker = PnlTracker::new(Decimal::from(1000), FeeRegime::Flat { rate: Decimal::new(2, 2) });
         tracker.apply_simulated_fill(
             ctx("yes-token", PriceAsset::Sol, OutcomeTokenSide::Yes),
             Decimal::new(40, 2),
@@ -898,7 +940,7 @@ mod tests {
 
     #[test]
     fn settlement_yes_win_realizes_and_removes_position() {
-        let mut tracker = PnlTracker::new(Decimal::from(1000), Decimal::ZERO);
+        let mut tracker = PnlTracker::new(Decimal::from(1000), FeeRegime::Flat { rate: Decimal::ZERO });
         let mut c = ctx("yes-token", PriceAsset::Btc, OutcomeTokenSide::Yes);
         c.end_time = Some(Utc::now() - chrono::Duration::seconds(20));
         c.strike_price = Some(Decimal::new(100, 0));
@@ -918,7 +960,7 @@ mod tests {
 
     #[test]
     fn settlement_no_win_realizes_and_removes_position() {
-        let mut tracker = PnlTracker::new(Decimal::from(1000), Decimal::ZERO);
+        let mut tracker = PnlTracker::new(Decimal::from(1000), FeeRegime::Flat { rate: Decimal::ZERO });
         let mut c = updown_ctx("no-token", PriceAsset::Eth, OutcomeTokenSide::No);
         c.end_time = Some(Utc::now() - chrono::Duration::seconds(20));
         c.reference_price = Some(Decimal::new(2000, 0));
@@ -941,7 +983,7 @@ mod tests {
 
     #[test]
     fn settlement_waits_for_grace_and_official_resolution() {
-        let mut tracker = PnlTracker::new(Decimal::from(1000), Decimal::ZERO);
+        let mut tracker = PnlTracker::new(Decimal::from(1000), FeeRegime::Flat { rate: Decimal::ZERO });
         let end = Utc::now() - chrono::Duration::seconds(5);
         let mut c = ctx("yes-token", PriceAsset::Btc, OutcomeTokenSide::Yes);
         c.end_time = Some(end);
@@ -965,7 +1007,7 @@ mod tests {
 
     #[test]
     fn settlement_does_not_close_without_official_outcome() {
-        let mut tracker = PnlTracker::new(Decimal::from(1000), Decimal::ZERO);
+        let mut tracker = PnlTracker::new(Decimal::from(1000), FeeRegime::Flat { rate: Decimal::ZERO });
         let now = Utc::now();
         let end = now - chrono::Duration::seconds(30);
         let mut c = ctx("yes-token", PriceAsset::Btc, OutcomeTokenSide::Yes);
@@ -982,7 +1024,7 @@ mod tests {
 
     #[test]
     fn settlement_allows_missing_numeric_final_price_when_outcome_exists() {
-        let mut tracker = PnlTracker::new(Decimal::from(1000), Decimal::ZERO);
+        let mut tracker = PnlTracker::new(Decimal::from(1000), FeeRegime::Flat { rate: Decimal::ZERO });
         let now = Utc::now();
         let end = now - chrono::Duration::seconds(30);
         let mut c = ctx("yes-token", PriceAsset::Btc, OutcomeTokenSide::Yes);
@@ -1001,7 +1043,7 @@ mod tests {
 
     #[test]
     fn snapshot_win_rate_uses_closed_trades() {
-        let mut tracker = PnlTracker::new(Decimal::from(1000), Decimal::ZERO);
+        let mut tracker = PnlTracker::new(Decimal::from(1000), FeeRegime::Flat { rate: Decimal::ZERO });
 
         let mut win_ctx = ctx("yes-token", PriceAsset::Btc, OutcomeTokenSide::Yes);
         win_ctx.end_time = Some(Utc::now() - chrono::Duration::seconds(20));
@@ -1031,7 +1073,7 @@ mod tests {
 
     #[test]
     fn has_active_position_blocks_duplicate_entry() {
-        let mut tracker = PnlTracker::new(Decimal::from(1000), Decimal::ZERO);
+        let mut tracker = PnlTracker::new(Decimal::from(1000), FeeRegime::Flat { rate: Decimal::ZERO });
         tracker.apply_simulated_fill(
             ctx("yes-token", PriceAsset::Btc, OutcomeTokenSide::Yes),
             Decimal::new(50, 2),
@@ -1044,7 +1086,7 @@ mod tests {
 
     #[test]
     fn available_capital_decreases_after_fill() {
-        let mut tracker = PnlTracker::new(Decimal::from(1000), Decimal::ZERO);
+        let mut tracker = PnlTracker::new(Decimal::from(1000), FeeRegime::Flat { rate: Decimal::ZERO });
         tracker.apply_simulated_fill(
             ctx("yes-token", PriceAsset::Eth, OutcomeTokenSide::Yes),
             Decimal::new(50, 2),
@@ -1057,7 +1099,7 @@ mod tests {
 
     #[test]
     fn deployed_capital_reflects_open_positions() {
-        let mut tracker = PnlTracker::new(Decimal::from(1000), Decimal::ZERO);
+        let mut tracker = PnlTracker::new(Decimal::from(1000), FeeRegime::Flat { rate: Decimal::ZERO });
         tracker.apply_simulated_fill(
             ctx("yes-token", PriceAsset::Xrp, OutcomeTokenSide::Yes),
             Decimal::new(50, 2),
@@ -1073,7 +1115,7 @@ mod tests {
 
     #[test]
     fn settled_condition_blocks_reentry() {
-        let mut tracker = PnlTracker::new(Decimal::from(1000), Decimal::ZERO);
+        let mut tracker = PnlTracker::new(Decimal::from(1000), FeeRegime::Flat { rate: Decimal::ZERO });
         let mut c = ctx("yes-token", PriceAsset::Btc, OutcomeTokenSide::Yes);
         c.end_time = Some(Utc::now() - chrono::Duration::seconds(20));
         tracker.apply_simulated_fill(c, Decimal::new(50, 2), Decimal::from(10));
@@ -1089,7 +1131,7 @@ mod tests {
 
     #[test]
     fn open_position_count_tracks_active_positions() {
-        let mut tracker = PnlTracker::new(Decimal::from(1000), Decimal::ZERO);
+        let mut tracker = PnlTracker::new(Decimal::from(1000), FeeRegime::Flat { rate: Decimal::ZERO });
         tracker.apply_simulated_fill(
             ctx("yes-token", PriceAsset::Sol, OutcomeTokenSide::Yes),
             Decimal::new(40, 2),
@@ -1104,7 +1146,7 @@ mod tests {
 
     #[test]
     fn pending_order_context_blocks_duplicate_entry() {
-        let mut tracker = PnlTracker::new(Decimal::from(1000), Decimal::ZERO);
+        let mut tracker = PnlTracker::new(Decimal::from(1000), FeeRegime::Flat { rate: Decimal::ZERO });
         let mut pending = ctx("pending-token", PriceAsset::Btc, OutcomeTokenSide::Yes);
         pending.condition_id = Some("cond-pending".to_string());
         tracker.register_order_context("order-1".to_string(), pending);
@@ -1117,7 +1159,7 @@ mod tests {
 
     #[test]
     fn available_capital_clamps_to_zero_when_deployed_exceeds_cash() {
-        let mut tracker = PnlTracker::new(Decimal::from(10), Decimal::ZERO);
+        let mut tracker = PnlTracker::new(Decimal::from(10), FeeRegime::Flat { rate: Decimal::ZERO });
         tracker.apply_simulated_fill(
             ctx("yes-token", PriceAsset::Eth, OutcomeTokenSide::Yes),
             Decimal::new(90, 2),
