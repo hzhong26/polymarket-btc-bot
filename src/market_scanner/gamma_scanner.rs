@@ -311,6 +311,7 @@ mod tests {
             max_net_edge: None,
             yes_edge_threshold_mult: Decimal::ONE,
             no_edge_threshold_mult: Decimal::ONE,
+            prob_shrinkage_alpha: None,
         }
     }
 

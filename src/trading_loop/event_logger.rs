@@ -471,6 +471,9 @@ pub fn pipeline_payload(
             "reference_price_source": d.reference_source.clone(),
             "strike_price": d.strike_price,
             "time_to_expiry_secs": d.time_to_expiry_secs,
+            "prob_pre_shrinkage": d.prob_pre_shrinkage,
+            "prob_post_shrinkage": d.prob_post_shrinkage,
+            "prob_shrinkage_alpha": d.prob_shrinkage_alpha,
         },
         "execution_context": {
             "orderbook": orderbook_payload(book, depth_levels),
@@ -800,6 +803,26 @@ pub fn market_scan_payload(
         "sol": sol,
         "unknown": unknown,
         "error": error,
+    })
+}
+
+pub fn reference_captured_payload(
+    asset: PriceAsset,
+    source: &str,
+    price: rust_decimal::Decimal,
+    window_start: chrono::DateTime<Utc>,
+    captured_at: chrono::DateTime<Utc>,
+    capture_trigger: &str,
+    capture_delay_secs: Option<i64>,
+) -> Value {
+    json!({
+        "asset": asset.symbol(),
+        "source": source,
+        "price": price.to_f64(),
+        "window_start": fmt_et_rfc3339(window_start),
+        "captured_at": fmt_et_rfc3339(captured_at),
+        "capture_trigger": capture_trigger,
+        "capture_delay_secs": capture_delay_secs,
     })
 }
 

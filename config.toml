@@ -18,7 +18,7 @@ api_url = "https://api.polymarket.com"
 chainlink_rpc_url = "https://polygon-bor-rpc.publicnode.com"
 chainlink_btc_usd_address = "0xc907E116054Ad103354f2D350FD2514433D57F6f"
 chainlink_eth_usd_address = "0xF9680D99D6C9589e2a93a78A04A279e509205945"
-chainlink_sol_usd_address = "0x10C8264C0935b3B9870013e4e1405290b27F15b4"
+chainlink_sol_usd_address = "0x10C8264C0935b3B9870013e057f330Ff3e9C56dC"
 chainlink_xrp_usd_address = "0x785ba89291f676b5386652eB12b30cF361020694"
 # Use self-captured reference price for entry when official price_to_beat is unavailable.
 captured_reference_for_entry = true
@@ -76,6 +76,9 @@ max_net_edge = "0.20"
 yes_edge_threshold_mult = "1.2"
 # NO-side trades must clear threshold × this multiplier (NO side 43.1% WR in Run 46).
 no_edge_threshold_mult = "1.2"
+# P9: Probability shrinkage toward market-implied price.
+# 1.0 = pure model; 0.7 = 70% model + 30% market. Omit to disable.
+# prob_shrinkage_alpha = 0.7  # disabled — collect v1.2.0 baseline first
 # Dashboard controls
 dashboard_enabled = true
 dashboard_live_interval_ms = 5000

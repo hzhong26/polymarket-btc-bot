@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
@@ -10,19 +10,19 @@ use chrono::{DateTime, Utc};
 /// Extracted from `position_settled` events.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
-struct SettledTrade {
-    condition_id: String,
-    asset: String,
-    side: String,
-    model_type: String,
-    predicted_yes_prob: f64,
-    model_yes_prob: Option<f64>,
-    actual_yes_outcome: bool,
-    won: bool,
-    realized_pnl: f64,
-    avg_entry_price: f64,
-    quantity: f64,
-    window_duration_secs: Option<i64>,
+pub(crate) struct SettledTrade {
+    pub(crate) condition_id: String,
+    pub(crate) asset: String,
+    pub(crate) side: String,
+    pub(crate) model_type: String,
+    pub(crate) predicted_yes_prob: f64,
+    pub(crate) model_yes_prob: Option<f64>,
+    pub(crate) actual_yes_outcome: bool,
+    pub(crate) won: bool,
+    pub(crate) realized_pnl: f64,
+    pub(crate) avg_entry_price: f64,
+    pub(crate) quantity: f64,
+    pub(crate) window_duration_secs: Option<i64>,
 }
 
 /// Extracted from `pipeline_evaluation` events (trade_candidate only).
@@ -52,6 +52,29 @@ struct VolAtTrade {
     strike: f64,
     model_type: String,
     reference_price: Option<f64>,
+}
+
+/// Extracted from `paper_order_placed` events.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct PendingOrderPlaced {
+    paper_order_id: String,
+    condition_id: String,
+    asset: String,
+    outcome_side: String,
+    net_edge: Option<f64>,
+}
+
+/// Extracted from enriched `paper_order_expired` events.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct ExpiredOrderOutcome {
+    paper_order_id: String,
+    condition_id: String,
+    asset: String,
+    outcome_side: String,
+    would_have_won: Option<bool>,
+    hypothetical_pnl: Option<f64>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -122,9 +145,71 @@ impl CalibrationBin {
     }
 }
 
+// ── Brier decomposition (Murphy 1973) ────────────────────────────
+
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+struct BrierDecomposition {
+    reliability: f64,
+    resolution: f64,
+    uncertainty: f64,
+    brier_score: f64,
+    base_rate: f64,
+    n: usize,
+}
+
+fn brier_decompose(bins: &[CalibrationBin; 10], n: usize) -> Option<BrierDecomposition> {
+    if n == 0 {
+        return None;
+    }
+    let nf = n as f64;
+
+    // Base rate: overall fraction of YES outcomes
+    let total_yes: u32 = bins.iter().map(|b| b.actual_yes_count).sum();
+    let base_rate = total_yes as f64 / nf;
+
+    let mut reliability = 0.0;
+    let mut resolution = 0.0;
+    for bin in bins {
+        if bin.count == 0 {
+            continue;
+        }
+        let nk = bin.count as f64;
+        let avg_pred = bin.avg_predicted();
+        let actual = bin.actual_rate();
+        reliability += nk * (avg_pred - actual).powi(2);
+        resolution += nk * (actual - base_rate).powi(2);
+    }
+    reliability /= nf;
+    resolution /= nf;
+    let uncertainty = base_rate * (1.0 - base_rate);
+
+    Some(BrierDecomposition {
+        reliability,
+        resolution,
+        uncertainty,
+        brier_score: reliability - resolution + uncertainty,
+        base_rate,
+        n,
+    })
+}
+
+fn brier_decompose_for(settled: &[SettledTrade], prob_fn: impl Fn(&SettledTrade) -> Option<f64>) -> Option<BrierDecomposition> {
+    let mut bins = [CalibrationBin::default(); 10];
+    let mut n = 0usize;
+    for t in settled {
+        if let Some(p) = prob_fn(t) {
+            let idx = ((p * 10.0).floor() as usize).min(9);
+            bins[idx].record(p, t.actual_yes_outcome);
+            n += 1;
+        }
+    }
+    brier_decompose(&bins, n)
+}
+
 // ── Parsing ────────────────────────────────────────────────────────
 
-fn parse_settled(payload: &serde_json::Value) -> Option<SettledTrade> {
+pub(crate) fn parse_settled(payload: &serde_json::Value) -> Option<SettledTrade> {
     let p = payload.get("payload")?;
     let condition_id = p.get("condition_id")?.as_str()?.to_string();
     let asset = p.get("asset")?.as_str()?.to_string();
@@ -269,9 +354,68 @@ fn parse_vol_at_trade(payload: &serde_json::Value) -> Option<VolAtTrade> {
     })
 }
 
+// ── Pending order parsers ──────────────────────────────────────────
+
+fn parse_pending_placed(val: &serde_json::Value) -> Option<PendingOrderPlaced> {
+    let p = val.get("payload")?;
+    let paper_order_id = p.get("paper_order_id")?.as_str()?.to_string();
+    let condition_id = p.get("condition_id")?.as_str()?.to_string();
+    let asset = p
+        .get("asset")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let outcome_side = p
+        .get("outcome_side")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let net_edge = p.get("net_edge").and_then(|v| v.as_f64());
+    Some(PendingOrderPlaced {
+        paper_order_id,
+        condition_id,
+        asset,
+        outcome_side,
+        net_edge,
+    })
+}
+
+fn parse_fill_order_id(val: &serde_json::Value) -> Option<String> {
+    val.get("payload")?
+        .get("order_id")?
+        .as_str()
+        .map(|s| s.to_string())
+}
+
+fn parse_expired_outcome(val: &serde_json::Value) -> Option<ExpiredOrderOutcome> {
+    let p = val.get("payload")?;
+    let paper_order_id = p.get("paper_order_id")?.as_str()?.to_string();
+    let condition_id = p.get("condition_id")?.as_str()?.to_string();
+    let asset = p
+        .get("asset")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let outcome_side = p
+        .get("outcome_side")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let would_have_won = p.get("would_have_won").and_then(|v| v.as_bool());
+    let hypothetical_pnl = p.get("hypothetical_pnl").and_then(|v| v.as_f64());
+    Some(ExpiredOrderOutcome {
+        paper_order_id,
+        condition_id,
+        asset,
+        outcome_side,
+        would_have_won,
+        hypothetical_pnl,
+    })
+}
+
 // ── Log file discovery ─────────────────────────────────────────────
 
-fn resolve_log_dirs(user_dirs: &[String]) -> anyhow::Result<Vec<PathBuf>> {
+pub(crate) fn resolve_log_dirs(user_dirs: &[String]) -> anyhow::Result<Vec<PathBuf>> {
     if user_dirs.is_empty() {
         // Auto-find latest day directory under logs/
         let day_dirs = all_day_dirs()?;
@@ -291,7 +435,7 @@ fn resolve_log_dirs(user_dirs: &[String]) -> anyhow::Result<Vec<PathBuf>> {
 }
 
 /// Return ALL YYYY-MM-DD day directories under logs/, sorted chronologically.
-fn all_day_dirs() -> anyhow::Result<Vec<PathBuf>> {
+pub(crate) fn all_day_dirs() -> anyhow::Result<Vec<PathBuf>> {
     let logs_root = Path::new("logs");
     if !logs_root.is_dir() {
         bail!("No logs/ directory found. Specify a path: cargo run -- --analyze <dir>");
@@ -312,7 +456,7 @@ fn all_day_dirs() -> anyhow::Result<Vec<PathBuf>> {
     Ok(day_dirs)
 }
 
-fn find_event_files(dirs: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
+pub(crate) fn find_event_files(dirs: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     for dir in dirs {
         for entry in std::fs::read_dir(dir)
@@ -337,22 +481,22 @@ fn find_event_files(dirs: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
 // ── Run discovery ─────────────────────────────────────────────────
 
 #[derive(Debug)]
-struct RunInfo {
-    run_id: String,
-    bot_version: String,
-    first_event_ts: String,
-    last_event_ts: String,
-    event_count: u64,
-    settled_count: u32,
-    candidate_count: u32,
-    wins: u32,
-    losses: u32,
-    total_pnl: f64,
+pub(crate) struct RunInfo {
+    pub(crate) run_id: String,
+    pub(crate) bot_version: String,
+    pub(crate) first_event_ts: String,
+    pub(crate) last_event_ts: String,
+    pub(crate) event_count: u64,
+    pub(crate) settled_count: u32,
+    pub(crate) candidate_count: u32,
+    pub(crate) wins: u32,
+    pub(crate) losses: u32,
+    pub(crate) total_pnl: f64,
 }
 
 /// Lightweight first pass: scan all JSONL files and extract per-run summary info.
 /// Only reads top-level fields (no deep payload parsing except for position_settled).
-fn discover_runs(files: &[PathBuf]) -> anyhow::Result<Vec<RunInfo>> {
+pub(crate) fn discover_runs(files: &[PathBuf]) -> anyhow::Result<Vec<RunInfo>> {
     let mut runs: HashMap<String, RunInfo> = HashMap::new();
 
     for file in files {
@@ -430,7 +574,7 @@ fn discover_runs(files: &[PathBuf]) -> anyhow::Result<Vec<RunInfo>> {
 }
 
 /// Fast extraction of a top-level JSON string field without full parse.
-fn extract_json_str(line: &str, key: &str) -> Option<String> {
+pub(crate) fn extract_json_str(line: &str, key: &str) -> Option<String> {
     let pattern = format!("\"{}\":\"", key);
     let start = line.find(&pattern)? + pattern.len();
     let rest = &line[start..];
@@ -456,7 +600,7 @@ fn format_event_ts(ts: &str) -> String {
 /// Resolve a --run argument to an actual run_id.
 /// If it parses as a positive integer, treat as 1-based index into the chronological run list.
 /// Otherwise, exact run_id match.
-fn resolve_run_id(runs: &[RunInfo], selector: &str) -> anyhow::Result<String> {
+pub(crate) fn resolve_run_id(runs: &[RunInfo], selector: &str) -> anyhow::Result<String> {
     // Try as 1-based index
     if let Ok(idx) = selector.parse::<usize>() {
         if idx == 0 {
@@ -563,6 +707,9 @@ struct ParsedLogs {
     evals: HashMap<String, TradeEval>,
     observations_by_asset: HashMap<String, Vec<PriceObservation>>,
     vol_at_trades: HashMap<String, VolAtTrade>,
+    pending_placed: Vec<PendingOrderPlaced>,
+    filled_order_ids: HashSet<String>,
+    expired_outcomes: Vec<ExpiredOrderOutcome>,
 }
 
 fn parse_logs(files: &[PathBuf], run_id_filter: Option<&str>) -> anyhow::Result<ParsedLogs> {
@@ -570,6 +717,9 @@ fn parse_logs(files: &[PathBuf], run_id_filter: Option<&str>) -> anyhow::Result<
     let mut evals: HashMap<String, TradeEval> = HashMap::new();
     let mut observations_by_asset: HashMap<String, Vec<PriceObservation>> = HashMap::new();
     let mut vol_at_trades: HashMap<String, VolAtTrade> = HashMap::new();
+    let mut pending_placed: Vec<PendingOrderPlaced> = Vec::new();
+    let mut filled_order_ids: HashSet<String> = HashSet::new();
+    let mut expired_outcomes: Vec<ExpiredOrderOutcome> = Vec::new();
 
     for file in files {
         let content = std::fs::read_to_string(file)
@@ -585,8 +735,13 @@ fn parse_logs(files: &[PathBuf], run_id_filter: Option<&str>) -> anyhow::Result<
                     _ => continue,
                 }
             }
-            // Fast check: skip lines that don't contain either event type
-            if !line.contains("position_settled") && !line.contains("pipeline_evaluation") {
+            // Fast check: skip lines that don't contain relevant event types
+            if !line.contains("position_settled")
+                && !line.contains("pipeline_evaluation")
+                && !line.contains("paper_order_placed")
+                && !line.contains("fill_applied")
+                && !line.contains("paper_order_expired")
+            {
                 continue;
             }
             let Ok(val) = serde_json::from_str::<serde_json::Value>(line) else {
@@ -616,6 +771,21 @@ fn parse_logs(files: &[PathBuf], run_id_filter: Option<&str>) -> anyhow::Result<
                         vol_at_trades.insert(vat.condition_id.clone(), vat);
                     }
                 }
+                "paper_order_placed" => {
+                    if let Some(placed) = parse_pending_placed(&val) {
+                        pending_placed.push(placed);
+                    }
+                }
+                "fill_applied" => {
+                    if let Some(order_id) = parse_fill_order_id(&val) {
+                        filled_order_ids.insert(order_id);
+                    }
+                }
+                "paper_order_expired" => {
+                    if let Some(expired) = parse_expired_outcome(&val) {
+                        expired_outcomes.push(expired);
+                    }
+                }
                 _ => {}
             }
         }
@@ -632,6 +802,9 @@ fn parse_logs(files: &[PathBuf], run_id_filter: Option<&str>) -> anyhow::Result<
         evals,
         observations_by_asset,
         vol_at_trades,
+        pending_placed,
+        filled_order_ids,
+        expired_outcomes,
     })
 }
 
@@ -815,7 +988,7 @@ fn report_win_rate(settled: &[SettledTrade], evals: &HashMap<String, TradeEval>)
 
 // ── Report 2: Calibration Curve ────────────────────────────────────
 
-fn brier_score(settled: &[SettledTrade]) -> f64 {
+pub(crate) fn brier_score(settled: &[SettledTrade]) -> f64 {
     if settled.is_empty() {
         return 0.0;
     }
@@ -955,6 +1128,63 @@ fn report_calibration(settled: &[SettledTrade]) {
     } else {
         println!("  Model Brier Score:    N/A  (no model_yes_prob in logs; run with updated bot)");
     }
+
+    // Brier decomposition — adjusted posterior
+    if let Some(d) = brier_decompose(&bins, settled.len()) {
+        println!();
+        println!("  === Brier Decomposition (Adjusted) ===");
+        println!(
+            "  Reliability:  {:.4}  (lower=better; miscalibration penalty)",
+            d.reliability
+        );
+        println!(
+            "  Resolution:   {:.4}  (higher=better; discriminative power)",
+            d.resolution
+        );
+        println!(
+            "  Uncertainty:  {:.4}  (dataset difficulty; base_rate={:.2})",
+            d.uncertainty, d.base_rate
+        );
+        println!(
+            "  Check:        {:.4}  (Rel - Res + Unc; should ≈ Brier)",
+            d.brier_score
+        );
+    }
+
+    // Per-asset decomposition
+    let mut assets: Vec<&str> = settled.iter().map(|t| t.asset.as_str()).collect();
+    assets.sort();
+    assets.dedup();
+    if assets.len() > 1 {
+        println!();
+        println!("  === Brier Decomposition by Asset ===");
+        println!(
+            "  {:<6} {:>5} {:>8} {:>8} {:>8} {:>8} {:>6}",
+            "Asset", "N", "Brier", "Reliab", "Resol", "Uncert", "Base%"
+        );
+        println!("  {}", "-".repeat(55));
+        for asset in &assets {
+            let subset: Vec<_> = settled
+                .iter()
+                .filter(|t| t.asset == *asset)
+                .cloned()
+                .collect();
+            if let Some(d) =
+                brier_decompose_for(&subset, |t| Some(t.predicted_yes_prob))
+            {
+                println!(
+                    "  {:<6} {:>5} {:>8.4} {:>8.4} {:>8.4} {:>8.4} {:>5.1}%",
+                    asset,
+                    d.n,
+                    d.brier_score,
+                    d.reliability,
+                    d.resolution,
+                    d.uncertainty,
+                    d.base_rate * 100.0
+                );
+            }
+        }
+    }
 }
 
 // ── Report 3: Edge Predictiveness ──────────────────────────────────
@@ -1027,6 +1257,240 @@ fn report_edge_predictiveness(settled: &[SettledTrade], evals: &HashMap<String, 
             edge
         ),
         None => println!("  -> No edge threshold achieves >=60% win rate in this dataset"),
+    }
+}
+
+// ── Report: Pending Order Fill Analysis ────────────────────────────
+
+fn report_pending_orders(
+    pending_placed: &[PendingOrderPlaced],
+    filled_order_ids: &HashSet<String>,
+    expired_outcomes: &[ExpiredOrderOutcome],
+    settled: &[SettledTrade],
+) {
+    if pending_placed.is_empty() {
+        return;
+    }
+
+    let total = pending_placed.len();
+    let filled_count = pending_placed
+        .iter()
+        .filter(|p| filled_order_ids.contains(&p.paper_order_id))
+        .count();
+    let expired_count = total - filled_count;
+
+    // Section 1: Fill Rate Summary
+    println!("\n=== Pending Order Fill Analysis ===");
+    println!("  Total placed:  {}", total);
+    println!(
+        "  Filled:        {:>4} ({:.1}%)",
+        filled_count,
+        filled_count as f64 / total as f64 * 100.0
+    );
+    println!(
+        "  Expired:       {:>4} ({:.1}%)",
+        expired_count,
+        expired_count as f64 / total as f64 * 100.0
+    );
+
+    // Section 2: Fill Rate by Asset
+    let mut by_asset: HashMap<String, (u32, u32)> = HashMap::new(); // (placed, filled)
+    for p in pending_placed {
+        let entry = by_asset.entry(p.asset.clone()).or_insert((0, 0));
+        entry.0 += 1;
+        if filled_order_ids.contains(&p.paper_order_id) {
+            entry.1 += 1;
+        }
+    }
+    let mut asset_keys: Vec<_> = by_asset.keys().cloned().collect();
+    asset_keys.sort();
+
+    println!(
+        "\n  {:<12} {:>6}   {:>6}   {:>7}   {:>6}",
+        "Asset", "Placed", "Filled", "Expired", "Fill%"
+    );
+    println!("  {}", "\u{2500}".repeat(47));
+    for asset in &asset_keys {
+        let (placed, filled) = by_asset[asset];
+        let expired = placed - filled;
+        let fill_pct = if placed > 0 {
+            filled as f64 / placed as f64 * 100.0
+        } else {
+            0.0
+        };
+        println!(
+            "  {:<12} {:>6}   {:>6}   {:>7}   {:>5.1}%",
+            asset, placed, filled, expired, fill_pct
+        );
+    }
+
+    // Section 3: Fill Rate by Side
+    let mut by_side: HashMap<String, (u32, u32)> = HashMap::new();
+    for p in pending_placed {
+        let entry = by_side.entry(p.outcome_side.clone()).or_insert((0, 0));
+        entry.0 += 1;
+        if filled_order_ids.contains(&p.paper_order_id) {
+            entry.1 += 1;
+        }
+    }
+    let mut side_keys: Vec<_> = by_side.keys().cloned().collect();
+    side_keys.sort();
+
+    println!(
+        "\n  {:<12} {:>6}   {:>6}   {:>7}   {:>6}",
+        "Side", "Placed", "Filled", "Expired", "Fill%"
+    );
+    println!("  {}", "\u{2500}".repeat(47));
+    for side in &side_keys {
+        let (placed, filled) = by_side[side];
+        let expired = placed - filled;
+        let fill_pct = if placed > 0 {
+            filled as f64 / placed as f64 * 100.0
+        } else {
+            0.0
+        };
+        println!(
+            "  {:<12} {:>6}   {:>6}   {:>7}   {:>5.1}%",
+            side, placed, filled, expired, fill_pct
+        );
+    }
+
+    // Section 4: Filled Trade Outcomes (join with settled by condition_id)
+    let filled_placed: Vec<_> = pending_placed
+        .iter()
+        .filter(|p| filled_order_ids.contains(&p.paper_order_id))
+        .collect();
+    let settled_by_cid: HashMap<&str, &SettledTrade> = settled
+        .iter()
+        .map(|t| (t.condition_id.as_str(), t))
+        .collect();
+
+    // By asset
+    let mut filled_by_asset: HashMap<String, BucketStats> = HashMap::new();
+    let mut filled_by_side: HashMap<String, BucketStats> = HashMap::new();
+    for fp in &filled_placed {
+        if let Some(st) = settled_by_cid.get(fp.condition_id.as_str()) {
+            filled_by_asset
+                .entry(fp.asset.clone())
+                .or_default()
+                .record(st.won, st.realized_pnl);
+            filled_by_side
+                .entry(fp.outcome_side.clone())
+                .or_default()
+                .record(st.won, st.realized_pnl);
+        }
+    }
+    if !filled_by_asset.is_empty() {
+        let mut buckets: Vec<_> = filled_by_asset.into_iter().collect();
+        buckets.sort_by(|a, b| a.0.cmp(&b.0));
+        print_bucket_table("Filled Trade Outcomes by Asset", &buckets);
+
+        let mut side_buckets: Vec<_> = filled_by_side.into_iter().collect();
+        side_buckets.sort_by(|a, b| a.0.cmp(&b.0));
+        print_bucket_table("Filled Trade Outcomes by Side", &side_buckets);
+    }
+
+    // Section 5: Expired Trade Hypothetical Outcomes
+    if expired_outcomes.is_empty() {
+        return;
+    }
+
+    let with_outcome: Vec<_> = expired_outcomes
+        .iter()
+        .filter(|e| e.would_have_won.is_some())
+        .collect();
+
+    if with_outcome.is_empty() {
+        println!("\n=== Expired Order Hypothetical Outcomes ===");
+        println!(
+            "  {} expired orders logged but no hypothetical data (run with enriched logging)",
+            expired_outcomes.len()
+        );
+        return;
+    }
+
+    let won_count = with_outcome
+        .iter()
+        .filter(|e| e.would_have_won == Some(true))
+        .count();
+    let lost_count = with_outcome.len() - won_count;
+    let hypo_pnl: f64 = with_outcome
+        .iter()
+        .filter_map(|e| e.hypothetical_pnl)
+        .sum();
+
+    println!("\n=== Expired Order Hypothetical Outcomes ===");
+    println!(
+        "  Would have won:  {} / {} ({:.1}%)",
+        won_count,
+        with_outcome.len(),
+        won_count as f64 / with_outcome.len() as f64 * 100.0
+    );
+    println!(
+        "  Would have lost: {} / {} ({:.1}%)",
+        lost_count,
+        with_outcome.len(),
+        lost_count as f64 / with_outcome.len() as f64 * 100.0
+    );
+    println!("  Hypothetical P&L: {:+.2}", hypo_pnl);
+
+    // By asset
+    let mut hypo_by_asset: HashMap<String, (u32, u32, f64)> = HashMap::new();
+    for e in &with_outcome {
+        let entry = hypo_by_asset.entry(e.asset.clone()).or_insert((0, 0, 0.0));
+        entry.0 += 1;
+        if e.would_have_won == Some(true) {
+            entry.1 += 1;
+        }
+        entry.2 += e.hypothetical_pnl.unwrap_or(0.0);
+    }
+    let mut hypo_keys: Vec<_> = hypo_by_asset.keys().cloned().collect();
+    hypo_keys.sort();
+
+    println!(
+        "\n  {:<12} {:>6}   {:>6}   {:>10}",
+        "Category", "Orders", "Won%", "Hypo P&L"
+    );
+    println!("  {}", "\u{2500}".repeat(40));
+    for key in &hypo_keys {
+        let (count, won, pnl) = hypo_by_asset[key];
+        let won_pct = if count > 0 {
+            won as f64 / count as f64 * 100.0
+        } else {
+            0.0
+        };
+        println!(
+            "  {:<12} {:>6}   {:>5.1}%   {:>+10.2}",
+            key, count, won_pct, pnl
+        );
+    }
+
+    // By side
+    let mut hypo_by_side: HashMap<String, (u32, u32, f64)> = HashMap::new();
+    for e in &with_outcome {
+        let entry = hypo_by_side
+            .entry(e.outcome_side.clone())
+            .or_insert((0, 0, 0.0));
+        entry.0 += 1;
+        if e.would_have_won == Some(true) {
+            entry.1 += 1;
+        }
+        entry.2 += e.hypothetical_pnl.unwrap_or(0.0);
+    }
+    let mut side_keys: Vec<_> = hypo_by_side.keys().cloned().collect();
+    side_keys.sort();
+
+    for key in &side_keys {
+        let (count, won, pnl) = hypo_by_side[key];
+        let won_pct = if count > 0 {
+            won as f64 / count as f64 * 100.0
+        } else {
+            0.0
+        };
+        println!(
+            "  {:<12} {:>6}   {:>5.1}%   {:>+10.2}",
+            key, count, won_pct, pnl
+        );
     }
 }
 
@@ -1210,7 +1674,7 @@ fn report_ewma_lambda_grid(
 /// If a path doesn't exist as a directory but stripping the last `-N` yields
 /// a valid directory, treat N as a run filter for that directory.
 /// Returns (cleaned dirs, optional run filter string).
-fn extract_inline_run_filter(user_dirs: &[String]) -> (Vec<String>, Option<String>) {
+pub(crate) fn extract_inline_run_filter(user_dirs: &[String]) -> (Vec<String>, Option<String>) {
     let mut dirs = Vec::new();
     let mut run_filter: Option<String> = None;
 
@@ -1275,6 +1739,9 @@ pub fn run(user_dirs: &[String], run_filter: Option<&str>) -> anyhow::Result<()>
         evals,
         observations_by_asset,
         vol_at_trades,
+        pending_placed,
+        filled_order_ids,
+        expired_outcomes,
     } = parsed;
 
     if settled.is_empty() {
@@ -1319,6 +1786,8 @@ pub fn run(user_dirs: &[String], run_filter: Option<&str>) -> anyhow::Result<()>
     if !observations_by_asset.is_empty() {
         report_ewma_lambda_grid(&observations_by_asset, &settled, &vol_at_trades);
     }
+
+    report_pending_orders(&pending_placed, &filled_order_ids, &expired_outcomes, &settled);
 
     println!();
     Ok(())
@@ -1510,5 +1979,49 @@ mod tests {
             assert_eq!(bin.sum_predicted, 0.0);
             assert_eq!(bin.actual_yes_count, 0);
         }
+    }
+
+    #[test]
+    fn brier_decompose_perfect_predictions() {
+        // All predictions exactly match outcomes → reliability≈0
+        let mut bins = [CalibrationBin::default(); 10];
+        // 5 trades at p=0.9, all YES (bin 9)
+        for _ in 0..5 {
+            bins[9].record(0.9, true);
+        }
+        // 5 trades at p=0.1, all NO (bin 1)
+        for _ in 0..5 {
+            bins[1].record(0.1, false);
+        }
+        let d = brier_decompose(&bins, 10).unwrap();
+        assert!(
+            d.reliability < 0.02,
+            "perfect-ish predictions should have near-zero reliability"
+        );
+        assert!(d.resolution > 0.0, "should have positive resolution");
+        assert!((d.brier_score - (d.reliability - d.resolution + d.uncertainty)).abs() < 1e-10);
+    }
+
+    #[test]
+    fn brier_decompose_identity_holds() {
+        // BS = Rel - Res + Unc must hold for arbitrary data
+        let mut bins = [CalibrationBin::default(); 10];
+        bins[3].record(0.35, true);
+        bins[3].record(0.32, false);
+        bins[7].record(0.75, true);
+        bins[7].record(0.71, true);
+        bins[7].record(0.78, false);
+        let d = brier_decompose(&bins, 5).unwrap();
+        let check = d.reliability - d.resolution + d.uncertainty;
+        assert!(
+            (d.brier_score - check).abs() < 1e-10,
+            "decomposition identity violated"
+        );
+    }
+
+    #[test]
+    fn brier_decompose_empty_returns_none() {
+        let bins = [CalibrationBin::default(); 10];
+        assert!(brier_decompose(&bins, 0).is_none());
     }
 }

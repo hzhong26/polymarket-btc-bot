@@ -1,4 +1,5 @@
 pub mod analyze;
+pub mod backtest;
 pub mod bayesian;
 pub mod config;
 pub mod dashboard_server;

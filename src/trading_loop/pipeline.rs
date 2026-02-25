@@ -62,6 +62,9 @@ pub struct PipelineDiagnostics {
     pub kelly_stake_usdc: Option<Decimal>,
     pub kelly_size_tokens: Option<Decimal>,
     pub fee_asymmetry_flip: Option<bool>,
+    pub prob_pre_shrinkage: Option<f64>,
+    pub prob_post_shrinkage: Option<f64>,
+    pub prob_shrinkage_alpha: Option<f64>,
 }
 
 /// What action (if any) should be taken for this market.
@@ -146,6 +149,7 @@ pub fn evaluate_market(
     max_net_edge: Option<f64>,
     yes_edge_threshold_mult: f64,
     no_edge_threshold_mult: f64,
+    prob_shrinkage_alpha: Option<f64>,
 ) -> PipelineResult {
     let market_asset = PriceAsset::from_market_question(&market.question);
     let aggregated_spot = price.spot_usd.to_f64();
@@ -192,6 +196,9 @@ pub fn evaluate_market(
         kelly_stake_usdc: None,
         kelly_size_tokens: None,
         fee_asymmetry_flip: None,
+        prob_pre_shrinkage: None,
+        prob_post_shrinkage: None,
+        prob_shrinkage_alpha: None,
     };
 
     if let Some(asset) = market_asset {
@@ -310,7 +317,20 @@ pub fn evaluate_market(
         };
     }
 
-    let posterior = posterior_details.adjusted_posterior;
+    let mut posterior = posterior_details.adjusted_posterior;
+
+    // P9: Probability shrinkage toward market-implied price.
+    if let Some(alpha) = prob_shrinkage_alpha {
+        let pre = posterior;
+        let market_p = posterior_details.market_implied;
+        posterior = alpha * pre + (1.0 - alpha) * market_p;
+        posterior = posterior.clamp(0.001, 0.999);
+        diagnostics.prob_pre_shrinkage = Some(pre);
+        diagnostics.prob_post_shrinkage = Some(posterior);
+        diagnostics.prob_shrinkage_alpha = Some(alpha);
+    }
+    diagnostics.posterior = Some(posterior);
+
     let effective_threshold =
         compute_effective_threshold(base_edge_threshold, confidence, spread, model_uncertainty);
     diagnostics.edge_threshold = effective_threshold;

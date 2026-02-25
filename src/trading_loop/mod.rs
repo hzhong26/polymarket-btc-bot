@@ -36,8 +36,9 @@ use self::reference_cache::{CapturedReference, ReferencePriceCache, ReferenceSou
 use self::dashboard::print_pnl_dashboard;
 use self::event_logger::{
     action_payload, closed_trade_payload, fill_applied_payload, market_scan_payload,
-    order_event_payload, pipeline_payload, pnl_snapshot_payload, run_ended_payload,
-    run_started_payload, traded_decision_payload, trading_eligibility_payload, EventLoggerHandle,
+    order_event_payload, pipeline_payload, pnl_snapshot_payload, reference_captured_payload,
+    run_ended_payload, run_started_payload, traded_decision_payload, trading_eligibility_payload,
+    EventLoggerHandle,
 };
 use self::paper_mode::{PaperPendingOrder, PaperTrader};
 use self::pipeline::PipelineAction;
@@ -89,6 +90,7 @@ pub struct TradingLoop {
     last_pnl_dashboard: chrono::DateTime<Utc>,
     last_settlement_check: chrono::DateTime<Utc>,
     last_reference_capture_probe: chrono::DateTime<Utc>,
+    last_boundary_capture: chrono::DateTime<Utc>,
     resolution_poll_not_before: HashMap<String, chrono::DateTime<Utc>>,
     scan_in_flight: bool,
     scan_result_tx: tokio::sync::mpsc::Sender<ScanResultMsg>,
@@ -174,6 +176,7 @@ impl TradingLoop {
             last_pnl_dashboard: Utc::now() - chrono::Duration::hours(1),
             last_settlement_check: Utc::now() - chrono::Duration::hours(1),
             last_reference_capture_probe: Utc::now() - chrono::Duration::hours(1),
+            last_boundary_capture: chrono::DateTime::UNIX_EPOCH,
             resolution_poll_not_before: HashMap::new(),
             scan_in_flight: false,
             scan_result_tx,
@@ -385,18 +388,7 @@ impl TradingLoop {
                     self.last_reference_capture_probe = now;
                 }
 
-                // Branch 7: Proactive reference capture at 5-minute window boundaries
-                _ = tokio::time::sleep(time_until_next_five_minute_boundary(Utc::now())),
-                    if self.price_feed_config.captured_reference_for_entry => {
-                    let boundary = floor_to_five_minute_boundary(Utc::now());
-                    info!(
-                        boundary_et = %fmt_et_log_time(boundary),
-                        "5-minute boundary reached, capturing reference prices"
-                    );
-                    self.capture_reference_at_boundary(boundary).await;
-                }
-
-                // Branch 8: Shutdown
+                // Branch 7: Shutdown
                 _ = shutdown.cancelled() => {
                     info!("shutdown signal received");
                     if let Some(handle) = self.pending_scan_handle.take() {
@@ -411,6 +403,21 @@ impl TradingLoop {
                         }
                     }
                     break "shutdown_signal";
+                }
+            }
+
+            // Proactive reference capture at 5-minute window boundaries.
+            // Runs after every select iteration (not inside a select branch) so it
+            // can never be starved by other branches winning the select race.
+            if self.price_feed_config.captured_reference_for_entry {
+                let current_boundary = floor_to_five_minute_boundary(Utc::now());
+                if current_boundary > self.last_boundary_capture {
+                    self.last_boundary_capture = current_boundary;
+                    info!(
+                        boundary_et = %fmt_et_log_time(current_boundary),
+                        "5-minute boundary reached, capturing reference prices"
+                    );
+                    self.capture_reference_at_boundary(current_boundary).await;
                 }
             }
 
@@ -570,71 +577,114 @@ impl TradingLoop {
                     window_start: start,
                 },
             );
+
+            self.event_logger.try_log_value(
+                "reference_captured",
+                reference_captured_payload(
+                    asset,
+                    source.as_str(),
+                    ref_price,
+                    start,
+                    now,
+                    "market_open",
+                    Some(capture_delay_secs),
+                ),
+            );
         }
     }
 
     /// Proactively fetch and cache reference prices for all assets at a 5-minute boundary.
     /// Does not depend on active_markets — runs unconditionally for all 4 assets so that
     /// the reference is ready before the scanner even picks up the new window's markets.
+    /// All Chainlink RPC calls are fired in parallel to minimize select-loop blocking time.
     async fn capture_reference_at_boundary(&mut self, boundary: chrono::DateTime<Utc>) {
         if !self.price_feed_config.captured_reference_for_entry {
             return;
         }
+
+        // Collect assets that need fetching and spawn parallel Chainlink calls.
+        let mut handles: Vec<(
+            PriceAsset,
+            Option<tokio::task::JoinHandle<Result<(Decimal, chrono::DateTime<Utc>), crate::price_feeds::PriceFeedError>>>,
+            Option<Decimal>, // spot fallback
+        )> = Vec::new();
 
         for asset in PriceAsset::ALL {
             if self.reference_cache.get(asset, boundary).is_some() {
                 continue;
             }
 
-            let (ref_price, source) = match self
-                .price_feed_config
-                .chainlink_address_for_asset(asset)
-            {
+            let spot_fallback = self
+                .latest_spot_by_asset
+                .get(&asset)
+                .map(|(_, s)| *s);
+
+            match self.price_feed_config.chainlink_address_for_asset(asset) {
                 Some(address) => {
-                    match fetch_chainlink_price_oneshot(
-                        &self.http_client,
-                        &self.price_feed_config.chainlink_rpc_url,
-                        address,
-                    )
-                    .await
-                    {
-                        Ok((cl_price, _ts)) => (cl_price, ReferenceSource::Chainlink),
-                        Err(e) => {
-                            let fallback = self
-                                .latest_spot_by_asset
-                                .get(&asset)
-                                .map(|(_, s)| *s);
-                            if let Some(spot) = fallback {
-                                warn!(
-                                    asset = %asset,
-                                    error = %e,
-                                    "chainlink failed at boundary, falling back to latest spot"
-                                );
-                                (spot, ReferenceSource::AggregatedSpot)
-                            } else {
-                                warn!(
-                                    asset = %asset,
-                                    error = %e,
-                                    "chainlink failed at boundary and no spot available, skipping"
-                                );
-                                continue;
-                            }
-                        }
-                    }
+                    let http = self.http_client.clone();
+                    let rpc_url = self.price_feed_config.chainlink_rpc_url.clone();
+                    let addr = address.to_string();
+                    let handle = tokio::spawn(async move {
+                        fetch_chainlink_price_oneshot(&http, &rpc_url, &addr).await
+                    });
+                    handles.push((asset, Some(handle), spot_fallback));
                 }
                 None => {
-                    let Some(spot) = self
-                        .latest_spot_by_asset
-                        .get(&asset)
-                        .map(|(_, s)| *s)
-                    else {
+                    handles.push((asset, None, spot_fallback));
+                }
+            }
+        }
+
+        // Await all results and apply to cache.
+        for (asset, handle, spot_fallback) in handles {
+            let (ref_price, source) = match handle {
+                Some(h) => match h.await {
+                    Ok(Ok((cl_price, _ts))) => (cl_price, ReferenceSource::Chainlink),
+                    Ok(Err(e)) => {
+                        if let Some(spot) = spot_fallback {
+                            warn!(
+                                asset = %asset,
+                                error = %e,
+                                "chainlink failed at boundary, falling back to latest spot"
+                            );
+                            (spot, ReferenceSource::AggregatedSpot)
+                        } else {
+                            warn!(
+                                asset = %asset,
+                                error = %e,
+                                "chainlink failed at boundary and no spot available, skipping"
+                            );
+                            continue;
+                        }
+                    }
+                    Err(e) => {
+                        if let Some(spot) = spot_fallback {
+                            warn!(
+                                asset = %asset,
+                                error = %e,
+                                "chainlink task panicked at boundary, falling back to latest spot"
+                            );
+                            (spot, ReferenceSource::AggregatedSpot)
+                        } else {
+                            warn!(
+                                asset = %asset,
+                                error = %e,
+                                "chainlink task panicked at boundary and no spot available, skipping"
+                            );
+                            continue;
+                        }
+                    }
+                },
+                None => {
+                    if let Some(spot) = spot_fallback {
+                        (spot, ReferenceSource::AggregatedSpot)
+                    } else {
                         debug!(
                             asset = %asset,
                             "no chainlink address and no spot available for boundary capture"
                         );
                         continue;
-                    };
-                    (spot, ReferenceSource::AggregatedSpot)
+                    }
                 }
             };
 
@@ -646,15 +696,29 @@ impl TradingLoop {
                 "boundary reference price captured"
             );
 
+            let captured_at = Utc::now();
             self.reference_cache.insert(
                 asset,
                 boundary,
                 CapturedReference {
                     price: ref_price,
                     source,
-                    captured_at: Utc::now(),
+                    captured_at,
                     window_start: boundary,
                 },
+            );
+
+            self.event_logger.try_log_value(
+                "reference_captured",
+                reference_captured_payload(
+                    asset,
+                    source.as_str(),
+                    ref_price,
+                    boundary,
+                    captured_at,
+                    "boundary",
+                    None,
+                ),
             );
         }
     }
@@ -691,15 +755,29 @@ impl TradingLoop {
                 spot = %spot,
                 "late reference capture from aggregated spot (missed capture window)"
             );
+            let captured_at = Utc::now();
             self.reference_cache.insert(
                 asset,
                 start,
                 reference_cache::CapturedReference {
                     price: *spot,
                     source: reference_cache::ReferenceSource::AggregatedSpot,
-                    captured_at: Utc::now(),
+                    captured_at,
                     window_start: start,
                 },
+            );
+
+            self.event_logger.try_log_value(
+                "reference_captured",
+                reference_captured_payload(
+                    asset,
+                    "aggregated_spot",
+                    *spot,
+                    start,
+                    captured_at,
+                    "late_fallback",
+                    None,
+                ),
             );
         }
     }
@@ -717,6 +795,35 @@ impl TradingLoop {
             for order in &expired {
                 self.pnl_tracker.clear_order_context(&order.paper_order_id);
                 self.remove_dashboard_pending(&order.condition_id, "expired");
+                // Compute hypothetical outcome fields for expired orders
+                let outcome_side = order.fill_context.outcome_side;
+                let spot_at_expiry = self
+                    .latest_spot_by_asset
+                    .get(&order.fill_context.asset)
+                    .map(|(_, s)| s.to_f64().unwrap_or(0.0));
+                let strike_price = order
+                    .fill_context
+                    .strike_price
+                    .and_then(|s| s.to_f64());
+                let would_have_won = match (outcome_side, spot_at_expiry, strike_price) {
+                    (Some(pnl::OutcomeTokenSide::Yes), Some(spot), Some(strike)) => {
+                        Some(spot >= strike)
+                    }
+                    (Some(pnl::OutcomeTokenSide::No), Some(spot), Some(strike)) => {
+                        Some(spot < strike)
+                    }
+                    _ => None,
+                };
+                let entry_price = order.limit_price.to_f64().unwrap_or(0.0);
+                let amount_f = order.amount.to_f64().unwrap_or(0.0);
+                let hypothetical_pnl = would_have_won.map(|won| {
+                    if won {
+                        (1.0 - entry_price) * amount_f
+                    } else {
+                        -entry_price * amount_f
+                    }
+                });
+
                 self.event_logger.try_log_value(
                     "paper_order_expired",
                     serde_json::json!({
@@ -728,6 +835,17 @@ impl TradingLoop {
                         "market_question": order.market_question,
                         "placed_at": order.placed_at.to_rfc3339(),
                         "end_time": order.end_time.to_rfc3339(),
+                        "asset": order.fill_context.asset.symbol(),
+                        "outcome_side": outcome_side.map(|s| match s {
+                            pnl::OutcomeTokenSide::Yes => "YES",
+                            pnl::OutcomeTokenSide::No  => "NO",
+                        }),
+                        "net_edge": order.diagnostics.net_edge,
+                        "posterior": order.diagnostics.posterior,
+                        "spot_at_expiry": spot_at_expiry,
+                        "strike_price": strike_price,
+                        "would_have_won": would_have_won,
+                        "hypothetical_pnl": hypothetical_pnl,
                     }),
                 );
                 info!(
@@ -1007,6 +1125,7 @@ impl TradingLoop {
                 self.config.max_net_edge.and_then(|d| d.to_f64()),
                 self.config.yes_edge_threshold_mult.to_f64().unwrap_or(1.0),
                 self.config.no_edge_threshold_mult.to_f64().unwrap_or(1.0),
+                self.config.prob_shrinkage_alpha,
             );
             let is_no_trade = matches!(result.action, PipelineAction::NoTrade { .. });
             let was_sampled = if is_no_trade {
@@ -1106,6 +1225,15 @@ impl TradingLoop {
                             "amount": amount.to_f64(),
                             "market_question": market.question,
                             "end_time": market.end_time.to_rfc3339(),
+                            "asset": result.diagnostics.market_asset,
+                            "outcome_side": match outcome_side_for_token(market, token_id) {
+                                pnl::OutcomeTokenSide::Yes => "YES",
+                                pnl::OutcomeTokenSide::No  => "NO",
+                            },
+                            "net_edge": result.diagnostics.net_edge,
+                            "posterior": result.diagnostics.posterior,
+                            "p_model": result.diagnostics.p_model,
+                            "kelly_stake_usdc": result.diagnostics.kelly_stake_usdc.and_then(|v| v.to_f64()),
                         }),
                     );
                     info!(
@@ -2005,15 +2133,6 @@ fn floor_to_five_minute_boundary(now: chrono::DateTime<Utc>) -> chrono::DateTime
     let secs = now.timestamp();
     let boundary_secs = (secs / 300) * 300;
     chrono::DateTime::from_timestamp(boundary_secs, 0).unwrap_or(now)
-}
-
-/// Duration until the next 5-minute boundary (e.g. at 9:27:34 → 2m26s until 9:30:00).
-fn time_until_next_five_minute_boundary(now: chrono::DateTime<Utc>) -> Duration {
-    let secs = now.timestamp();
-    let next_secs = (secs / 300 + 1) * 300;
-    let next = chrono::DateTime::from_timestamp(next_secs, 0)
-        .unwrap_or(now + chrono::Duration::seconds(300));
-    (next - now).to_std().unwrap_or(Duration::from_secs(300))
 }
 
 #[cfg(test)]

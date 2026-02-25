@@ -11,6 +11,15 @@ pub enum ReferenceSource {
     AggregatedSpot,
 }
 
+impl ReferenceSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Chainlink => "chainlink",
+            Self::AggregatedSpot => "aggregated_spot",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CapturedReference {
     pub price: Decimal,

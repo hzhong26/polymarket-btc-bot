@@ -138,6 +138,10 @@ pub struct TradingConfig {
     /// Multiply edge threshold for NO-side trades (default 1.0 = no penalty).
     #[serde(default = "default_multiplier")]
     pub no_edge_threshold_mult: Decimal,
+    /// Probability shrinkage: blend model prob toward market price.
+    /// 1.0 = pure model (no shrinkage), 0.5 = 50/50. None = disabled (same as 1.0).
+    #[serde(default)]
+    pub prob_shrinkage_alpha: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
