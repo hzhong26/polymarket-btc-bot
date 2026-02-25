@@ -39,7 +39,7 @@ use self::event_logger::{
     order_event_payload, pipeline_payload, pnl_snapshot_payload, run_ended_payload,
     run_started_payload, traded_decision_payload, trading_eligibility_payload, EventLoggerHandle,
 };
-use self::paper_mode::PaperTrader;
+use self::paper_mode::{PaperPendingOrder, PaperTrader};
 use self::pipeline::PipelineAction;
 use self::pnl::{FillContext, OutcomeTokenSide, PnlTracker};
 
@@ -221,6 +221,13 @@ impl TradingLoop {
     fn push_dashboard_closed(&self, record: serde_json::Value) {
         if let Some(ref state) = self.dashboard_state {
             state.push_closed(record.to_string());
+        }
+    }
+
+    /// Remove a pending order from the dashboard (filled or expired).
+    fn remove_dashboard_pending(&self, condition_id: &str, reason: &str) {
+        if let Some(ref state) = self.dashboard_state {
+            state.remove_pending(condition_id, reason);
         }
     }
 
@@ -703,6 +710,35 @@ impl TradingLoop {
         self.capture_reference_prices_at(Utc::now()).await;
         self.late_capture_from_spot_if_blocked();
         self.prune_expired_markets(Utc::now(), "price_update");
+
+        // Expire unfilled paper orders whose markets have ended
+        if self.paper_mode {
+            let expired = self.paper_trader.expire_stale(Utc::now());
+            for order in &expired {
+                self.pnl_tracker.clear_order_context(&order.paper_order_id);
+                self.remove_dashboard_pending(&order.condition_id, "expired");
+                self.event_logger.try_log_value(
+                    "paper_order_expired",
+                    serde_json::json!({
+                        "paper_order_id": order.paper_order_id,
+                        "condition_id": order.condition_id,
+                        "token_id": order.token_id,
+                        "limit_price": order.limit_price.to_f64(),
+                        "amount": order.amount.to_f64(),
+                        "market_question": order.market_question,
+                        "placed_at": order.placed_at.to_rfc3339(),
+                        "end_time": order.end_time.to_rfc3339(),
+                    }),
+                );
+                info!(
+                    paper_order_id = %order.paper_order_id,
+                    condition_id = %order.condition_id,
+                    market = %order.market_question,
+                    "paper order expired unfilled"
+                );
+            }
+        }
+
         self.maybe_log_eligibility_snapshot(price.asset);
 
         let asset_tuning = self.asset_tuning_for(price.asset);
@@ -788,7 +824,9 @@ impl TradingLoop {
             };
             // Also fetch the NO token order book when we hold a NO position so
             // the displayed mark price matches Polymarket's own NO book price.
-            let no_book = if self.pnl_tracker.has_active_no_position(market) {
+            let no_book = if self.pnl_tracker.has_active_no_position(market)
+                || (self.paper_mode && self.paper_trader.has_pending_no_order(&market.token_id_no))
+            {
                 match venue.get_orderbook(&market.token_id_no).await {
                     Ok(b) => Some(b),
                     Err(e) => {
@@ -800,6 +838,119 @@ impl TradingLoop {
                 None
             };
             self.pnl_tracker.update_market_marks(market, &book, no_book.as_ref());
+
+            // Paper mode: check if a pending order can now be filled against this book
+            if self.paper_mode && self.paper_trader.has_pending(&market.condition_id) {
+                // Determine which book to check: use the token-specific book
+                let pending_is_no = self.paper_trader.has_pending_no_order(&market.token_id_no);
+                let fill_book = if pending_is_no {
+                    no_book.as_ref().unwrap_or(&book)
+                } else {
+                    &book
+                };
+                if let Some(order) = self.paper_trader.check_fill(&market.condition_id, fill_book) {
+                    self.pnl_tracker.apply_live_fill(
+                        &order.paper_order_id,
+                        order.limit_price,
+                        order.amount,
+                    );
+                    self.pnl_tracker.clear_order_context(&order.paper_order_id);
+                    self.event_logger.try_log_value(
+                        "fill_applied",
+                        fill_applied_payload(
+                            Some(&order.paper_order_id),
+                            order.side,
+                            order.limit_price,
+                            order.amount,
+                            true,
+                        ),
+                    );
+                    self.event_logger.try_log_value(
+                        "traded_decision",
+                        traded_decision_payload(
+                            Some(&order.paper_order_id),
+                            &order.condition_id,
+                            &order.token_id,
+                            order.side,
+                            order.limit_price,
+                            order.amount,
+                            &order.market_question,
+                            order.diagnostics.model_type,
+                            order.diagnostics.posterior,
+                            order.diagnostics.net_edge,
+                        ),
+                    );
+                    // Dashboard: remove from pending, push opened event
+                    if let Some(ref state) = dash {
+                        state.remove_pending(&order.condition_id, "filled");
+                        let d = &order.diagnostics;
+                        let outcome_side = order
+                            .fill_context
+                            .outcome_side
+                            .unwrap_or(pnl::OutcomeTokenSide::Yes);
+                        let opened_msg = serde_json::json!({
+                            "t": "opened",
+                            "ts": Utc::now().timestamp_millis(),
+                            "token_id": order.token_id,
+                            "condition_id": order.condition_id,
+                            "asset": d.market_asset,
+                            "question": order.market_question,
+                            "opened_at": Utc::now().to_rfc3339(),
+                            "model_type": d.model_type,
+                            "p_model": d.p_model,
+                            "market_implied_p": d.market_implied_p,
+                            "posterior": d.posterior,
+                            "gross_edge": d.gross_edge,
+                            "net_edge": d.net_edge,
+                            "cost_fee": d.cost_fee,
+                            "cost_slippage": d.cost_slippage,
+                            "cost_total": d.cost_total,
+                            "kelly_raw": d.kelly_raw,
+                            "kelly_adjusted": d.kelly_adjusted,
+                            "kelly_final": d.kelly_final,
+                            "kelly_stake_usdc": d.kelly_stake_usdc.and_then(|v| v.to_f64()),
+                            "entry_price": order.limit_price.to_f64(),
+                            "quantity": order.amount.to_f64(),
+                            "end_time": order.end_time.to_rfc3339(),
+                            "side": match outcome_side {
+                                pnl::OutcomeTokenSide::Yes => "YES",
+                                pnl::OutcomeTokenSide::No  => "NO",
+                            },
+                        });
+                        state.push_opened(opened_msg.to_string());
+                    }
+                    if let Some(ref mut ts) = self.trade_sheet {
+                        let outcome_side = order
+                            .fill_context
+                            .outcome_side
+                            .unwrap_or(pnl::OutcomeTokenSide::Yes);
+                        ts.record_opened(
+                            order.token_id.clone(),
+                            order.fill_context.asset.symbol().to_string(),
+                            Utc::now(),
+                            Some(order.end_time),
+                            order.fill_context.window_start,
+                            match outcome_side {
+                                pnl::OutcomeTokenSide::Yes => "YES".to_string(),
+                                pnl::OutcomeTokenSide::No => "NO".to_string(),
+                            },
+                            order.diagnostics.kelly_stake_usdc.and_then(|v| v.to_f64()),
+                            order.diagnostics.cost_fee,
+                        );
+                    }
+                    info!(
+                        paper_order_id = %order.paper_order_id,
+                        condition_id = %order.condition_id,
+                        market = %order.market_question,
+                        price = %order.limit_price,
+                        amount = %order.amount,
+                        "paper order filled on subsequent tick"
+                    );
+                }
+                // Whether filled or still pending, skip new pipeline eval for this market
+                continue;
+            }
+
             if self
                 .pnl_tracker
                 .has_active_or_settled_position(&market.condition_id)
@@ -855,6 +1006,7 @@ impl TradingLoop {
                 self.config.min_time_to_expiry_secs as i64,
                 self.config.max_net_edge.and_then(|d| d.to_f64()),
                 self.config.yes_edge_threshold_mult.to_f64().unwrap_or(1.0),
+                self.config.no_edge_threshold_mult.to_f64().unwrap_or(1.0),
             );
             let is_no_trade = matches!(result.action, PipelineAction::NoTrade { .. });
             let was_sampled = if is_no_trade {
@@ -899,99 +1051,108 @@ impl TradingLoop {
                     amount,
                 } = &result.action
                 {
-                    self.pnl_tracker.apply_simulated_fill(
-                        FillContext {
-                            token_id: token_id.clone(),
-                            asset: market_asset,
-                            market_question: market.question.clone(),
-                            side: *side,
-                            condition_id: Some(market.condition_id.clone()),
-                            end_time: Some(market.end_time),
-                            window_start: market.start_time,
-                            strike_price: Some(market.strike_price),
-                            reference_price: effective_entry_reference.or_else(|| {
-                                result
-                                    .diagnostics
-                                    .reference_price
-                                    .and_then(|v| Decimal::try_from(v).ok())
-                            }),
-                            official_price_to_beat: market.polymarket_price_to_beat,
-                            model_type: Some(result.diagnostics.model_type.to_string()),
-                            predicted_yes_prob: result.diagnostics.posterior,
-                            model_yes_prob: result.diagnostics.p_model,
-                            outcome_side: Some(outcome_side_for_token(market, token_id)),
-                        },
-                        *order_price,
-                        *amount,
+                    // Create a pending order instead of filling instantly.
+                    // The order will be checked for fill on subsequent ticks.
+                    let paper_order_id = format!(
+                        "paper-{}-{}",
+                        &market.condition_id[..8.min(market.condition_id.len())],
+                        Utc::now().timestamp_millis()
                     );
+                    let fill_context = FillContext {
+                        token_id: token_id.clone(),
+                        asset: market_asset,
+                        market_question: market.question.clone(),
+                        side: *side,
+                        condition_id: Some(market.condition_id.clone()),
+                        end_time: Some(market.end_time),
+                        window_start: market.start_time,
+                        strike_price: Some(market.strike_price),
+                        reference_price: effective_entry_reference.or_else(|| {
+                            result
+                                .diagnostics
+                                .reference_price
+                                .and_then(|v| Decimal::try_from(v).ok())
+                        }),
+                        official_price_to_beat: market.polymarket_price_to_beat,
+                        model_type: Some(result.diagnostics.model_type.to_string()),
+                        predicted_yes_prob: result.diagnostics.posterior,
+                        model_yes_prob: result.diagnostics.p_model,
+                        outcome_side: Some(outcome_side_for_token(market, token_id)),
+                    };
+                    let pending = PaperPendingOrder {
+                        paper_order_id: paper_order_id.clone(),
+                        token_id: token_id.clone(),
+                        condition_id: market.condition_id.clone(),
+                        side: *side,
+                        limit_price: *order_price,
+                        amount: *amount,
+                        placed_at: Utc::now(),
+                        end_time: market.end_time,
+                        fill_context: fill_context.clone(),
+                        diagnostics: result.diagnostics.clone(),
+                        market_question: market.question.clone(),
+                    };
+                    self.pnl_tracker
+                        .register_order_context(paper_order_id.clone(), fill_context);
+                    self.paper_trader.place_pending(pending);
                     self.event_logger.try_log_value(
-                        "fill_applied",
-                        fill_applied_payload(None, *side, *order_price, *amount, true),
+                        "paper_order_placed",
+                        serde_json::json!({
+                            "paper_order_id": paper_order_id,
+                            "condition_id": market.condition_id,
+                            "token_id": token_id,
+                            "side": match side { Side::Buy => "BUY", Side::Sell => "SELL" },
+                            "limit_price": order_price.to_f64(),
+                            "amount": amount.to_f64(),
+                            "market_question": market.question,
+                            "end_time": market.end_time.to_rfc3339(),
+                        }),
                     );
-                    self.event_logger.try_log_value(
-                        "traded_decision",
-                        traded_decision_payload(
-                            None,
-                            &market.condition_id,
-                            token_id,
-                            *side,
-                            *order_price,
-                            *amount,
-                            &market.question,
-                            result.diagnostics.model_type,
-                            result.diagnostics.posterior,
-                            result.diagnostics.net_edge,
-                        ),
+                    info!(
+                        paper_order_id = %paper_order_id,
+                        condition_id = %market.condition_id,
+                        market = %market.question,
+                        side = ?side,
+                        price = %order_price,
+                        amount = %amount,
+                        "paper order placed (pending fill on next tick)"
                     );
-                    // Dashboard: opened event
+                    // Dashboard: pending event
                     if let Some(ref state) = dash {
                         let d = &result.diagnostics;
-                        let opened_msg = serde_json::json!({
-                            "t": "opened",
+                        let outcome_side = outcome_side_for_token(market, token_id);
+                        let pending_msg = serde_json::json!({
+                            "t": "pending",
                             "ts": Utc::now().timestamp_millis(),
-                            "token_id": token_id,
                             "condition_id": market.condition_id,
-                            "asset": market_asset.symbol(),
+                            "token_id": token_id,
+                            "asset": d.market_asset,
                             "question": market.question,
-                            "opened_at": Utc::now().to_rfc3339(),
-                            "model_type": d.model_type,
-                            "p_model": d.p_model,
-                            "market_implied_p": d.market_implied_p,
-                            "posterior": d.posterior,
-                            "gross_edge": d.gross_edge,
-                            "net_edge": d.net_edge,
-                            "cost_fee": d.cost_fee,
-                            "cost_slippage": d.cost_slippage,
-                            "cost_total": d.cost_total,
-                            "kelly_raw": d.kelly_raw,
-                            "kelly_adjusted": d.kelly_adjusted,
-                            "kelly_final": d.kelly_final,
-                            "kelly_stake_usdc": d.kelly_stake_usdc.and_then(|v| v.to_f64()),
-                            "entry_price": order_price.to_f64(),
-                            "quantity": amount.to_f64(),
-                            "end_time": market.end_time.to_rfc3339(),
-                            "window_start": market.start_time.map(|t| t.to_rfc3339()),
-                            "side": match outcome_side_for_token(market, token_id) {
+                            "side": match outcome_side {
                                 pnl::OutcomeTokenSide::Yes => "YES",
                                 pnl::OutcomeTokenSide::No  => "NO",
                             },
-                        });
-                        state.push_opened(opened_msg.to_string());
-                    }
-                    if let Some(ref mut ts) = self.trade_sheet {
-                        ts.record_opened(
-                            token_id.clone(),
-                            market_asset.symbol().to_string(),
-                            Utc::now(),
-                            Some(market.end_time),
-                            market.start_time,
-                            match outcome_side_for_token(market, token_id) {
-                                pnl::OutcomeTokenSide::Yes => "YES".to_string(),
-                                pnl::OutcomeTokenSide::No => "NO".to_string(),
+                            "limit_price": order_price.to_f64(),
+                            "amount": amount.to_f64(),
+                            "placed_at": Utc::now().to_rfc3339(),
+                            "end_time": market.end_time.to_rfc3339(),
+                            "window_start": market.start_time.map(|t| t.to_rfc3339()),
+                            "diagnostics": {
+                                "p_model": d.p_model,
+                                "market_implied_p": d.market_implied_p,
+                                "posterior": d.posterior,
+                                "gross_edge": d.gross_edge,
+                                "net_edge": d.net_edge,
+                                "cost_fee": d.cost_fee,
+                                "cost_slippage": d.cost_slippage,
+                                "cost_total": d.cost_total,
+                                "kelly_raw": d.kelly_raw,
+                                "kelly_adjusted": d.kelly_adjusted,
+                                "kelly_final": d.kelly_final,
+                                "kelly_stake_usdc": d.kelly_stake_usdc.and_then(|v| v.to_f64()),
                             },
-                            result.diagnostics.kelly_stake_usdc.and_then(|v| v.to_f64()),
-                            result.diagnostics.cost_fee,
-                        );
+                        });
+                        state.push_pending(pending_msg.to_string());
                     }
                 }
                 let snapshot = self.pnl_tracker.snapshot();
@@ -1215,6 +1376,7 @@ impl TradingLoop {
             if self
                 .pnl_tracker
                 .has_active_or_settled_position(&market.condition_id)
+                || self.paper_trader.has_pending(&market.condition_id)
             {
                 snapshot.blocked_idempotency += 1;
                 continue;
@@ -1542,9 +1704,12 @@ impl TradingLoop {
 
     fn prune_expired_markets(&mut self, now: chrono::DateTime<Utc>, phase: &str) -> usize {
         let open_cids = self.pnl_tracker.open_condition_ids();
+        let pending_cids = self.paper_trader.pending_condition_ids();
         let before = self.active_markets.len();
         self.active_markets.retain(|market| {
-            market.end_time > now || open_cids.contains(&market.condition_id)
+            market.end_time > now
+                || open_cids.contains(&market.condition_id)
+                || pending_cids.contains(&market.condition_id)
         });
         let removed = before.saturating_sub(self.active_markets.len());
         if removed > 0 {

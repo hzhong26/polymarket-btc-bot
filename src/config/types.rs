@@ -135,6 +135,9 @@ pub struct TradingConfig {
     /// Multiply edge threshold for YES-side trades (default 1.0 = no penalty).
     #[serde(default = "default_multiplier")]
     pub yes_edge_threshold_mult: Decimal,
+    /// Multiply edge threshold for NO-side trades (default 1.0 = no penalty).
+    #[serde(default = "default_multiplier")]
+    pub no_edge_threshold_mult: Decimal,
 }
 
 #[derive(Debug, Clone, Deserialize)]

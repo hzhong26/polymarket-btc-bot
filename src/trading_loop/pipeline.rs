@@ -145,6 +145,7 @@ pub fn evaluate_market(
     min_time_to_expiry_secs: i64,
     max_net_edge: Option<f64>,
     yes_edge_threshold_mult: f64,
+    no_edge_threshold_mult: f64,
 ) -> PipelineResult {
     let market_asset = PriceAsset::from_market_question(&market.question);
     let aggregated_spot = price.spot_usd.to_f64();
@@ -428,10 +429,10 @@ pub fn evaluate_market(
     diagnostics.kelly_size_tokens = Some(position.size_tokens);
 
     // Step 6: threshold check using dynamic effective threshold.
-    // Apply YES-side multiplier so YES trades need more edge to pass.
-    let side_threshold = match edge_result.side {
-        EdgeSide::BuyYes => effective_threshold * yes_edge_threshold_mult,
-        EdgeSide::BuyNo => effective_threshold,
+    // Apply side-specific multiplier so each side can have its own edge bar.
+    let (side_threshold, side_mult) = match edge_result.side {
+        EdgeSide::BuyYes => (effective_threshold * yes_edge_threshold_mult, yes_edge_threshold_mult),
+        EdgeSide::BuyNo => (effective_threshold * no_edge_threshold_mult, no_edge_threshold_mult),
     };
     diagnostics.edge_threshold = side_threshold;
     diagnostics.threshold_pass = Some(edge_result.net_edge >= side_threshold);
@@ -445,7 +446,7 @@ pub fn evaluate_market(
             action: PipelineAction::NoTrade {
                 reason: format!(
                     "net edge {:.4} below effective threshold {:.4} (side_mult={:.2})",
-                    net_edge, side_threshold, yes_edge_threshold_mult
+                    net_edge, side_threshold, side_mult
                 ),
             },
         };

@@ -13,6 +13,7 @@ use tracing::{info, warn};
 const SNAP_CAP: usize = 20_000;
 const OPENED_CAP: usize = 200;
 const CLOSED_CAP: usize = 200;
+const PENDING_CAP: usize = 100;
 const BROADCAST_CAP: usize = 512;
 
 // ---------------------------------------------------------------------------
@@ -23,6 +24,7 @@ pub struct DashboardState {
     snaps: Mutex<VecDeque<String>>,
     opened: Mutex<VecDeque<String>>,
     closed: Mutex<VecDeque<String>>,
+    pending: Mutex<VecDeque<String>>,
     tx: broadcast::Sender<String>,
 }
 
@@ -51,6 +53,32 @@ impl DashboardState {
         ring_push(&self.closed, s.clone(), CLOSED_CAP);
         let _ = self.tx.send(s);
     }
+
+    pub fn push_pending(&self, s: String) {
+        ring_push(&self.pending, s.clone(), PENDING_CAP);
+        let _ = self.tx.send(s);
+    }
+
+    /// Remove a pending order by condition_id and broadcast a removal event.
+    pub fn remove_pending(&self, condition_id: &str, reason: &str) {
+        {
+            let mut guard = self.pending.lock().expect("pending mutex poisoned");
+            guard.retain(|entry| {
+                // Parse the JSON to check condition_id; keep entries that don't match
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(entry) {
+                    v.get("condition_id").and_then(|c| c.as_str()) != Some(condition_id)
+                } else {
+                    true
+                }
+            });
+        }
+        let msg = serde_json::json!({
+            "t": "pending_remove",
+            "condition_id": condition_id,
+            "reason": reason,
+        });
+        let _ = self.tx.send(msg.to_string());
+    }
 }
 
 /// Create the shared dashboard state.
@@ -60,6 +88,7 @@ pub fn make_dashboard_state() -> SharedState {
         snaps: Mutex::new(VecDeque::with_capacity(SNAP_CAP)),
         opened: Mutex::new(VecDeque::with_capacity(OPENED_CAP)),
         closed: Mutex::new(VecDeque::with_capacity(CLOSED_CAP)),
+        pending: Mutex::new(VecDeque::with_capacity(PENDING_CAP)),
         tx,
     })
 }
@@ -104,7 +133,7 @@ async fn handle_socket(mut socket: WebSocket, state: SharedState) {
     // Subscribe to live updates before reading history to avoid a race.
     let mut rx = state.tx.subscribe();
 
-    // Build init message with all three ring buffers.
+    // Build init message with all ring buffers.
     let init_msg = {
         let snaps = state
             .snaps
@@ -127,11 +156,19 @@ async fn handle_socket(mut socket: WebSocket, state: SharedState) {
             .iter()
             .cloned()
             .collect::<Vec<_>>();
+        let pending = state
+            .pending
+            .lock()
+            .expect("pending mutex poisoned")
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
         format!(
-            r#"{{"t":"init","snaps":[{}],"opened":[{}],"closed":[{}]}}"#,
+            r#"{{"t":"init","snaps":[{}],"opened":[{}],"closed":[{}],"pending":[{}]}}"#,
             snaps.join(","),
             opened.join(","),
-            closed.join(",")
+            closed.join(","),
+            pending.join(",")
         )
     };
     if socket.send(Message::Text(init_msg)).await.is_err() {
@@ -292,9 +329,11 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
 
   <div id="trades">
     <div class="tab-bar">
+      <button class="tab-btn" id="tab-pending" onclick="showTab('pending')">Pending</button>
       <button class="tab-btn active" id="tab-open" onclick="showTab('open')">Open Trades</button>
       <button class="tab-btn" id="tab-closed" onclick="showTab('closed')">Closed Trades</button>
     </div>
+    <div id="panel-pending" class="cards" style="display:none"></div>
     <div id="panel-open" class="cards"></div>
     <div id="panel-closed" class="cards" style="display:none"></div>
   </div>
@@ -363,6 +402,7 @@ const openTrades = {};        // token_id -> opened event
 const closedTrades = [];      // array of closed records
 let latestPositions = [];     // positions array from latest snap
 const allOpenedEvents = {};   // token_id -> opened event (persists after close)
+const pendingTrades = {};     // condition_id -> pending order event
 
 // ---- Timeframe filter ------------------------------------------------------
 const TF_MAP = {
@@ -520,10 +560,12 @@ function applyStats(snap) {
 // ---- Tab switching ---------------------------------------------------------
 function showTab(tab) {
   activeTab = tab;
+  $('tab-pending').classList.toggle('active', tab === 'pending');
   $('tab-open').classList.toggle('active', tab === 'open');
   $('tab-closed').classList.toggle('active', tab === 'closed');
-  $('panel-open').style.display   = tab === 'open'   ? '' : 'none';
-  $('panel-closed').style.display = tab === 'closed' ? '' : 'none';
+  $('panel-pending').style.display = tab === 'pending' ? '' : 'none';
+  $('panel-open').style.display    = tab === 'open'    ? '' : 'none';
+  $('panel-closed').style.display  = tab === 'closed'  ? '' : 'none';
 }
 
 // ---- Page switching --------------------------------------------------------
@@ -764,6 +806,52 @@ function renderClosedCards() {
   [...closedTrades].reverse().forEach(rec => panel.appendChild(renderClosedCard(rec)));
 }
 
+function computePendingTimeframe(msg) {
+  if (!msg.end_time || !msg.window_start) return '?';
+  const secs = (new Date(msg.end_time) - new Date(msg.window_start)) / 1000;
+  if (Math.abs(secs - 300)  <= 30) return '5min';
+  if (Math.abs(secs - 900)  <= 30) return '15min';
+  if (Math.abs(secs - 3600) <= 60) return '1h';
+  return Math.round(secs / 60) + 'min';
+}
+
+function renderPendingCard(msg) {
+  const card = document.createElement('div');
+  card.className = 'card yellow';
+  card.onclick = () => openModal('pending_detail', null, null, msg);
+  const asset = msg.asset || '?';
+  const tf = computePendingTimeframe(msg);
+  const side = msg.side || '?';
+  const d = msg.diagnostics || {};
+  card.innerHTML =
+    '<div class="card-header">' +
+      '<span>&#x23F3; PENDING</span>' +
+      '<span>' + asset + '</span>' +
+      '<span style="margin-left:auto;color:#8b949e">' + tf + '</span>' +
+    '</div>' +
+    '<div class="card-title">' + (msg.question || '—') + '</div>' +
+    '<div class="card-row"><span>Side</span><span>' + side + '</span></div>' +
+    '<div class="card-row"><span>Limit Price</span><span>$' + Number(msg.limit_price || 0).toFixed(3) + '</span></div>' +
+    '<div class="card-row"><span>Amount (USDC)</span><span>$' + Number(msg.amount || 0).toFixed(2) + '</span></div>' +
+    '<div class="card-row"><span>Placed At</span><span>' + fmtTime(msg.placed_at) + '</span></div>' +
+    '<div class="card-row"><span>Expires</span><span>' + fmtTime(msg.end_time) + '</span></div>' +
+    (d.net_edge != null ? '<div class="card-row" style="margin-top:6px"><span>Net Edge</span><span>' + (d.net_edge * 100).toFixed(1) + '%</span></div>' : '') +
+    (d.posterior != null ? '<div class="card-row"><span>Posterior</span><span>' + (d.posterior * 100).toFixed(1) + '%</span></div>' : '') +
+    (d.kelly_final != null ? '<div class="card-row"><span>Kelly Final</span><span>' + d.kelly_final.toFixed(4) + '</span></div>' : '');
+  return card;
+}
+
+function renderPendingCards() {
+  const panel = $('panel-pending');
+  panel.innerHTML = '';
+  const keys = Object.keys(pendingTrades);
+  if (keys.length === 0) {
+    panel.innerHTML = '<div class="no-trades">No pending orders</div>';
+    return;
+  }
+  keys.forEach(cid => panel.appendChild(renderPendingCard(pendingTrades[cid])));
+}
+
 // ---- Modal -----------------------------------------------------------------
 function mRow(label, val, cls) {
   return '<div class="modal-row"><span class="label">' + label + '</span><span class="val' + (cls ? ' ' + cls : '') + '">' + (val ?? '—') + '</span></div>';
@@ -772,7 +860,41 @@ function mSection(title, rows) {
   return '<div class="modal-section"><h4>' + title + '</h4>' + rows + '</div>';
 }
 
-function openModal(type, tokenId, closedRec) {
+function openModal(type, tokenId, closedRec, pendingMsg) {
+  if (type === 'pending_detail') {
+    const p = pendingMsg;
+    const d = p.diagnostics || {};
+    $('modal-title').textContent = p.question || 'Pending Order';
+    $('modal-body').innerHTML =
+      mSection('Order Info',
+        mRow('Asset', p.asset) +
+        mRow('Side', p.side) +
+        mRow('Limit Price', p.limit_price != null ? '$' + Number(p.limit_price).toFixed(3) : null) +
+        mRow('Amount', p.amount != null ? '$' + Number(p.amount).toFixed(2) : null) +
+        mRow('Placed At', fmtDateTime(p.placed_at)) +
+        mRow('Expires', fmtDateTime(p.end_time))
+      ) +
+      mSection('Model &amp; Probability',
+        mRow('P(model)', fmtPctRaw(d.p_model)) +
+        mRow('Market P', fmtPctRaw(d.market_implied_p)) +
+        mRow('Posterior', fmtPctRaw(d.posterior))
+      ) +
+      mSection('Edge &amp; Costs',
+        mRow('Gross Edge', d.gross_edge != null ? fmt(d.gross_edge * 100, 1) + '%' : null) +
+        mRow('Net Edge', d.net_edge != null ? fmt(d.net_edge * 100, 1) + '%' : null) +
+        mRow('Fee Cost', d.cost_fee != null ? (d.cost_fee * 100).toFixed(2) + '%' : null) +
+        mRow('Slippage', d.cost_slippage != null ? (d.cost_slippage * 100).toFixed(2) + '%' : null) +
+        mRow('Total Cost', d.cost_total != null ? (d.cost_total * 100).toFixed(2) + '%' : null)
+      ) +
+      mSection('Kelly Sizing',
+        mRow('Kelly Raw', d.kelly_raw != null ? d.kelly_raw.toFixed(4) : null) +
+        mRow('Kelly Adjusted', d.kelly_adjusted != null ? d.kelly_adjusted.toFixed(4) : null) +
+        mRow('Kelly Final', d.kelly_final != null ? d.kelly_final.toFixed(4) : null) +
+        mRow('Stake (USDC)', d.kelly_stake_usdc != null ? '$' + Number(d.kelly_stake_usdc).toFixed(2) : null)
+      );
+    $('modal-overlay').classList.add('open');
+    return;
+  }
   if (type === 'open') {
     const ev = openTrades[tokenId];
     if (!ev) return;
@@ -880,6 +1002,16 @@ function handleClosed(msg) {
   if (activePage === 'sheet') renderTradesTable();
 }
 
+function handlePending(msg) {
+  pendingTrades[msg.condition_id] = msg;
+  if (activeTab === 'pending') renderPendingCards();
+}
+
+function handlePendingRemove(msg) {
+  delete pendingTrades[msg.condition_id];
+  if (activeTab === 'pending') renderPendingCards();
+}
+
 function handleInit(msg) {
   (msg.snaps || []).forEach(s => {
     const ts = s.ts || Date.now();
@@ -895,10 +1027,14 @@ function handleInit(msg) {
     delete openTrades[c.token_id];
     closedTrades.push(c);
   });
+  (msg.pending || []).forEach(p => {
+    pendingTrades[p.condition_id] = p;
+  });
   if (allSnaps.length > 0) applyStats(allSnaps[allSnaps.length - 1].snap);
   redrawCharts();
   renderOpenCards(latestPositions);
   renderClosedCards();
+  renderPendingCards();
   if (activePage === 'sheet') renderTradesTable();
 }
 
@@ -915,10 +1051,12 @@ function connect() {
   ws.onmessage = evt => {
     let data;
     try { data = JSON.parse(evt.data); } catch { return; }
-    if      (data.t === 'init')   handleInit(data);
-    else if (data.t === 'snap')   handleSnap(data);
-    else if (data.t === 'opened') handleOpened(data);
-    else if (data.t === 'closed') handleClosed(data);
+    if      (data.t === 'init')           handleInit(data);
+    else if (data.t === 'snap')           handleSnap(data);
+    else if (data.t === 'opened')         handleOpened(data);
+    else if (data.t === 'closed')         handleClosed(data);
+    else if (data.t === 'pending')        handlePending(data);
+    else if (data.t === 'pending_remove') handlePendingRemove(data);
   };
 }
 

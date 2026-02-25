@@ -310,6 +310,7 @@ mod tests {
             asset_params: Default::default(),
             max_net_edge: None,
             yes_edge_threshold_mult: Decimal::ONE,
+            no_edge_threshold_mult: Decimal::ONE,
         }
     }
 

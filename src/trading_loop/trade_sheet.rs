@@ -410,7 +410,7 @@ impl TradeSheetWriter {
         };
         let net_profit = total_pnl - total_fee;
 
-        out += "\nTotals,Trades,Wins,Losses,Win %,P&L,ROI %,Fees,Net Profit\n";
+        out += "\nTotals,Trades,Wins,Losses,Win %,Total P&L,ROI %,Fees,Net Profit\n";
         out += &format!(
             ",{},{},{},{:.1},{:.2},{:.1},{:.2},{:.2}\n",
             total, wins, losses, win_pct, total_pnl, roi_pct, total_fee, net_profit,
@@ -430,7 +430,7 @@ impl TradeSheetWriter {
         }
 
         // ── P&L by Coin (for bar chart) ─────────────────────────────────
-        out += "\nP&L by Coin,P&L,Staked,ROI %\n";
+        out += "\nP&L by Coin,Total P&L,Staked,ROI %\n";
         for coin in &coins {
             let subset: Vec<&&TradeRow> = closed.iter().filter(|r| r.coin == *coin).collect();
             let c_pnl: f64 = subset
@@ -443,7 +443,7 @@ impl TradeSheetWriter {
         }
 
         // ── Breakdown: Coin x Timeframe (for grouped bar chart) ─────────
-        out += "\nCoin x Timeframe,Coin,Timeframe,Wins,Losses,Win %,P&L\n";
+        out += "\nCoin x Timeframe,Coin,Timeframe,Wins,Losses,Win %,Total P&L\n";
         for coin in &coins {
             let subset: Vec<&&TradeRow> = closed.iter().filter(|r| r.coin == *coin).collect();
             let timeframes = ordered_timeframes(&subset);

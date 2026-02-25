@@ -521,7 +521,7 @@ pub fn list_runs(user_dirs: &[String]) -> anyhow::Result<()> {
     println!();
     println!(
         "  {:<4} {:<46} {:<8} {:<24} {:<24} {:>5}  {:>7}  {:>5}  {:>10}",
-        "#", "Run ID", "Version", "First Event", "Last Event", "Cands", "Settled", "W/L", "P&L"
+        "#", "Run ID", "Version", "First Event", "Last Event", "Cands", "Settled", "W/L", "Total P&L"
     );
     println!("  {}", "\u{2500}".repeat(140));
 
@@ -677,10 +677,10 @@ fn edge_bucket(edge: f64) -> &'static str {
 fn print_bucket_table(title: &str, buckets: &[(String, BucketStats)]) {
     println!("\n=== {} ===", title);
     println!(
-        "  {:<20} {:>6}   {:>4}   {:>6}   {:>8}",
-        "Category", "Trades", "Wins", "Win%", "Avg P&L"
+        "  {:<20} {:>6}   {:>4}   {:>6}   {:>10}   {:>8}",
+        "Category", "Trades", "Wins", "Win%", "Total P&L", "Avg P&L"
     );
-    println!("  {}", "-".repeat(52));
+    println!("  {}", "-".repeat(64));
 
     let mut total = BucketStats::default();
     for (label, stats) in buckets {
@@ -691,21 +691,23 @@ fn print_bucket_table(title: &str, buckets: &[(String, BucketStats)]) {
         total.wins += stats.wins;
         total.total_pnl += stats.total_pnl;
         println!(
-            "  {:<20} {:>6}   {:>4}   {:>5.1}%   {:>+8.2}",
+            "  {:<20} {:>6}   {:>4}   {:>5.1}%   {:>+10.2}   {:>+8.2}",
             label,
             stats.trades,
             stats.wins,
             stats.win_pct(),
+            stats.total_pnl,
             stats.avg_pnl(),
         );
     }
-    println!("  {}", "-".repeat(52));
+    println!("  {}", "-".repeat(64));
     println!(
-        "  {:<20} {:>6}   {:>4}   {:>5.1}%   {:>+8.2}",
+        "  {:<20} {:>6}   {:>4}   {:>5.1}%   {:>+10.2}   {:>+8.2}",
         "TOTAL",
         total.trades,
         total.wins,
         total.win_pct(),
+        total.total_pnl,
         total.avg_pnl(),
     );
 }
@@ -960,10 +962,10 @@ fn report_calibration(settled: &[SettledTrade]) {
 fn report_edge_predictiveness(settled: &[SettledTrade], evals: &HashMap<String, TradeEval>) {
     println!("\n=== Edge Predictiveness ===");
     println!(
-        "  {:<14} {:>6}   {:>6}   {:>8}",
-        "Net Edge", "Trades", "Win%", "Avg P&L"
+        "  {:<14} {:>6}   {:>6}   {:>10}   {:>8}",
+        "Net Edge", "Trades", "Win%", "Total P&L", "Avg P&L"
     );
-    println!("  {}", "-".repeat(42));
+    println!("  {}", "-".repeat(54));
 
     let edge_order = ["<0.10", "0.10-0.15", "0.15-0.20", "0.20-0.25", "0.25+"];
     let mut by_edge: HashMap<String, BucketStats> = HashMap::new();
@@ -981,10 +983,11 @@ fn report_edge_predictiveness(settled: &[SettledTrade], evals: &HashMap<String, 
         if let Some(stats) = by_edge.get(*label) {
             if stats.trades > 0 {
                 println!(
-                    "  {:<14} {:>6}   {:>5.1}%   {:>+8.2}",
+                    "  {:<14} {:>6}   {:>5.1}%   {:>+10.2}   {:>+8.2}",
                     label,
                     stats.trades,
                     stats.win_pct(),
+                    stats.total_pnl,
                     stats.avg_pnl(),
                 );
             }
