@@ -483,15 +483,7 @@ impl InternationalClient {
     }
 
     async fn fetch_gamma_json(&self, url: &str) -> Result<serde_json::Value, VenueError> {
-        self.http
-            .get(url)
-            .send()
-            .await?
-            .error_for_status()
-            .map_err(VenueError::Http)?
-            .json()
-            .await
-            .map_err(VenueError::Http)
+        gamma_get_json(&self.http, url).await.map_err(VenueError::Http)
     }
 
     async fn enrich_missing_price_to_beat(
@@ -871,6 +863,59 @@ impl InternationalClient {
     }
 }
 
+/// Retry-capable HTTP GET for Gamma API endpoints.
+/// Retries up to 2 times with exponential backoff (500ms, 1s) on transport
+/// errors and 5xx server errors. Does NOT retry on 4xx or JSON parse errors.
+async fn gamma_get_json(
+    http: &reqwest::Client,
+    url: &str,
+) -> Result<serde_json::Value, reqwest::Error> {
+    const MAX_RETRIES: u32 = 2;
+    const BASE_BACKOFF_MS: u64 = 500;
+
+    let mut last_err: Option<reqwest::Error> = None;
+
+    for attempt in 0..=MAX_RETRIES {
+        if attempt > 0 {
+            let backoff = std::time::Duration::from_millis(BASE_BACKOFF_MS * (1 << (attempt - 1)));
+            warn!(
+                attempt,
+                max_retries = MAX_RETRIES,
+                backoff_ms = backoff.as_millis() as u64,
+                url = %url,
+                error = %last_err.as_ref().unwrap(),
+                "retrying Gamma API request"
+            );
+            tokio::time::sleep(backoff).await;
+        }
+
+        let resp = match http.get(url).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = Some(e);
+                continue;
+            }
+        };
+
+        // Don't retry 4xx — those are permanent failures
+        if resp.status().is_client_error() {
+            return Err(resp.error_for_status().unwrap_err());
+        }
+
+        // Retry 5xx server errors
+        if resp.status().is_server_error() {
+            let err = resp.error_for_status().unwrap_err();
+            last_err = Some(err);
+            continue;
+        }
+
+        // Parse JSON — don't retry deserialization errors
+        return resp.json().await;
+    }
+
+    Err(last_err.unwrap())
+}
+
 struct TagFetchResult {
     tag: String,
     markets: Vec<TargetMarket>,
@@ -911,28 +956,12 @@ async fn fetch_tag_pages(
             url = %url,
             "fetching tagged markets from Gamma API"
         );
-        let resp = match http
-            .get(&url)
-            .send()
-            .await
-            .and_then(|r| r.error_for_status())
-        {
-            Ok(r) => match r.json::<serde_json::Value>().await {
-                Ok(v) => {
-                    result.had_success = true;
-                    result.pages_fetched += 1;
-                    v
-                }
-                Err(e) => {
-                    if !result.had_success {
-                        warn!(tag = %tag, error = %e, "tagged Gamma query failed; scheduling fallback for this tag");
-                        result.error = Some(VenueError::Http(e));
-                    } else {
-                        warn!(tag = %tag, page, error = %e, "tagged Gamma pagination failed after partial success");
-                    }
-                    break;
-                }
-            },
+        let resp = match gamma_get_json(http, &url).await {
+            Ok(v) => {
+                result.had_success = true;
+                result.pages_fetched += 1;
+                v
+            }
             Err(e) => {
                 if !result.had_success {
                     warn!(tag = %tag, error = %e, "tagged Gamma query failed; scheduling fallback for this tag");

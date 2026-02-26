@@ -446,6 +446,27 @@ impl TradingLoop {
                 }
             }
 
+            // Drain pending scan results outside `select!` to prevent starvation.
+            // Branch 1 (price updates) often wins the select race because Binance WS
+            // pushes data every 100-500ms; this guarantees scan results are consumed
+            // at most one loop iteration late — same pattern as reference capture above.
+            if self.scan_in_flight {
+                if let Ok((scanned_at, scan_result)) = self.scan_result_rx.try_recv() {
+                    self.scan_in_flight = false;
+                    self.pending_scan_handle.take();
+                    self.apply_scan_result(scanned_at, scan_result);
+                }
+            }
+
+            // Same anti-starvation drain for settlement results.
+            if self.settlement_in_flight {
+                if let Ok(results) = self.settlement_result_rx.try_recv() {
+                    self.settlement_in_flight = false;
+                    self.pending_settlement_handle.take();
+                    self.apply_settlement_results(results);
+                }
+            }
+
             // Check kill switch
             if self.kill_switch.is_triggered() {
                 error!("kill switch active — halting trading loop");
