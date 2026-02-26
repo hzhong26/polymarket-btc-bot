@@ -10,6 +10,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::future::join_all;
+
 use chrono::Utc;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
@@ -51,6 +53,7 @@ const REFERENCE_CAPTURE_PROBE_INTERVAL: Duration = Duration::from_millis(500);
 const MARKET_WINDOW_TOLERANCE_SECS: i64 = 30;
 const PRICE_STARVATION_TIMEOUT: Duration = Duration::from_secs(30);
 const SCAN_TIMEOUT: Duration = Duration::from_secs(15);
+const ORDERBOOK_FETCH_TIMEOUT: Duration = Duration::from_secs(3);
 const RESOLUTION_POLL_INTERVAL_SECS: i64 = 5;
 type ScanResultMsg = (
     chrono::DateTime<Utc>,
@@ -532,15 +535,17 @@ impl TradingLoop {
                 .chainlink_address_for_asset(asset)
             {
                 Some(address) => {
-                    match fetch_chainlink_price_oneshot(
-                        &self.http_client,
-                        &self.price_feed_config.chainlink_rpc_url,
-                        address,
-                    )
-                    .await
-                    {
-                        Ok((cl_price, _ts)) => (cl_price, ReferenceSource::Chainlink),
-                        Err(e) => {
+                    let cl_result = tokio::time::timeout(
+                        ORDERBOOK_FETCH_TIMEOUT,
+                        fetch_chainlink_price_oneshot(
+                            &self.http_client,
+                            &self.price_feed_config.chainlink_rpc_url,
+                            address,
+                        ),
+                    ).await;
+                    match cl_result {
+                        Ok(Ok((cl_price, _ts))) => (cl_price, ReferenceSource::Chainlink),
+                        Ok(Err(e)) => {
                             let fallback_spot = self
                                 .latest_spot_by_asset
                                 .get(&asset)
@@ -557,6 +562,25 @@ impl TradingLoop {
                                     asset = %asset,
                                     error = %e,
                                     "chainlink oneshot failed and no aggregated spot fallback available yet"
+                                );
+                                continue;
+                            }
+                        }
+                        Err(_) => {
+                            let fallback_spot = self
+                                .latest_spot_by_asset
+                                .get(&asset)
+                                .map(|(_, spot)| *spot);
+                            if let Some(spot) = fallback_spot {
+                                warn!(
+                                    asset = %asset,
+                                    "chainlink oneshot timed out, falling back to latest aggregated spot"
+                                );
+                                (spot, ReferenceSource::AggregatedSpot)
+                            } else {
+                                warn!(
+                                    asset = %asset,
+                                    "chainlink oneshot timed out and no aggregated spot fallback available"
                                 );
                                 continue;
                             }
@@ -933,7 +957,17 @@ impl TradingLoop {
             return;
         }
 
-        for market in &self.active_markets.clone() {
+        // ── Phase 1: Collect markets that need orderbook fetches ──
+        let active_markets = self.active_markets.clone();
+        struct BookFetchPlan {
+            market_idx: usize,
+            market_asset: PriceAsset,
+            effective_entry_reference: Option<Decimal>,
+            needs_no_book: bool,
+        }
+        let mut fetch_plans: Vec<BookFetchPlan> = Vec::new();
+
+        for (idx, market) in active_markets.iter().enumerate() {
             let Some(market_asset) = PriceAsset::from_market_question(&market.question) else {
                 continue;
             };
@@ -956,28 +990,71 @@ impl TradingLoop {
                 continue;
             }
 
-            // Get current orderbook (YES token)
-            let book = match venue.get_orderbook(&market.token_id_yes).await {
-                Ok(b) => b,
-                Err(e) => {
+            let needs_no_book = self.pnl_tracker.has_active_no_position(market)
+                || (self.paper_mode && self.paper_trader.has_pending_no_order(&market.token_id_no));
+
+            fetch_plans.push(BookFetchPlan {
+                market_idx: idx,
+                market_asset,
+                effective_entry_reference,
+                needs_no_book,
+            });
+        }
+
+        // ── Phase 2: Fetch all orderbooks concurrently (3s timeout per request) ──
+        let fetch_futures: Vec<_> = fetch_plans.iter().map(|plan| {
+            let yes_token = active_markets[plan.market_idx].token_id_yes.clone();
+            let no_token = active_markets[plan.market_idx].token_id_no.clone();
+            let needs_no = plan.needs_no_book;
+            async move {
+                let yes_book = tokio::time::timeout(
+                    ORDERBOOK_FETCH_TIMEOUT,
+                    venue.get_orderbook(&yes_token),
+                ).await;
+                let no_book = if needs_no {
+                    Some(tokio::time::timeout(
+                        ORDERBOOK_FETCH_TIMEOUT,
+                        venue.get_orderbook(&no_token),
+                    ).await)
+                } else {
+                    None
+                };
+                (yes_book, no_book)
+            }
+        }).collect();
+
+        let fetched_books = join_all(fetch_futures).await;
+
+        // ── Phase 3: Process each market with pre-fetched orderbooks ──
+        for (plan, (yes_result, no_result)) in fetch_plans.into_iter().zip(fetched_books) {
+            let market = &active_markets[plan.market_idx];
+            let market_asset = plan.market_asset;
+            let effective_entry_reference = plan.effective_entry_reference;
+
+            // Unwrap YES orderbook (required)
+            let book = match yes_result {
+                Ok(Ok(b)) => b,
+                Ok(Err(e)) => {
                     debug!(market = %market.question, error = %e, "failed to get orderbook");
                     continue;
                 }
-            };
-            // Also fetch the NO token order book when we hold a NO position so
-            // the displayed mark price matches Polymarket's own NO book price.
-            let no_book = if self.pnl_tracker.has_active_no_position(market)
-                || (self.paper_mode && self.paper_trader.has_pending_no_order(&market.token_id_no))
-            {
-                match venue.get_orderbook(&market.token_id_no).await {
-                    Ok(b) => Some(b),
-                    Err(e) => {
-                        debug!(market = %market.question, error = %e, "failed to get NO orderbook");
-                        None
-                    }
+                Err(_) => {
+                    warn!(market = %market.question, "orderbook fetch timed out (YES)");
+                    continue;
                 }
-            } else {
-                None
+            };
+            // Unwrap optional NO orderbook
+            let no_book = match no_result {
+                Some(Ok(Ok(b))) => Some(b),
+                Some(Ok(Err(e))) => {
+                    debug!(market = %market.question, error = %e, "failed to get NO orderbook");
+                    None
+                }
+                Some(Err(_)) => {
+                    warn!(market = %market.question, "orderbook fetch timed out (NO)");
+                    None
+                }
+                None => None,
             };
             self.pnl_tracker.update_market_marks(market, &book, no_book.as_ref());
 
