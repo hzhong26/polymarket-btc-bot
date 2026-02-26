@@ -36,7 +36,8 @@ use self::reference_cache::{CapturedReference, ReferencePriceCache, ReferenceSou
 use self::dashboard::print_pnl_dashboard;
 use self::event_logger::{
     action_payload, closed_trade_payload, fill_applied_payload, market_scan_payload,
-    order_event_payload, pipeline_payload, pnl_snapshot_payload, reference_captured_payload,
+    order_event_payload, pipeline_payload, pnl_snapshot_payload, price_update_payload,
+    reference_captured_payload,
     run_ended_payload, run_started_payload, traded_decision_payload, trading_eligibility_payload,
     EventLoggerHandle,
 };
@@ -803,6 +804,8 @@ impl TradingLoop {
     }
 
     async fn handle_price_update(&mut self, venue: &dyn VenueClient, price: &AggregatedPrice) {
+        self.event_logger
+            .try_log_value("price_update", price_update_payload(price));
         self.latest_spot_by_asset
             .insert(price.asset, (price.timestamp, price.spot_usd));
         self.capture_reference_prices_at(Utc::now()).await;

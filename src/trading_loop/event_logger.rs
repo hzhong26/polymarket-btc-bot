@@ -806,6 +806,19 @@ pub fn market_scan_payload(
     })
 }
 
+pub fn price_update_payload(price: &AggregatedPrice) -> Value {
+    json!({
+        "asset": price.asset.symbol(),
+        "spot_usd": price.spot_usd.to_f64(),
+        "timestamp": fmt_et_rfc3339(price.timestamp),
+        "num_sources": price.num_sources,
+        "spread": price.spread.to_f64(),
+        "confidence": price.confidence.to_f64(),
+        "quorum_met": price.quorum_met,
+        "observations": observations_payload(price),
+    })
+}
+
 pub fn reference_captured_payload(
     asset: PriceAsset,
     source: &str,
