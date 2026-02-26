@@ -50,6 +50,7 @@ const SETTLEMENT_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const REFERENCE_CAPTURE_PROBE_INTERVAL: Duration = Duration::from_millis(500);
 const MARKET_WINDOW_TOLERANCE_SECS: i64 = 30;
 const PRICE_STARVATION_TIMEOUT: Duration = Duration::from_secs(30);
+const SCAN_TIMEOUT: Duration = Duration::from_secs(15);
 const RESOLUTION_POLL_INTERVAL_SECS: i64 = 5;
 type ScanResultMsg = (
     chrono::DateTime<Utc>,
@@ -1641,11 +1642,27 @@ impl TradingLoop {
 
         let tx = self.settlement_result_tx.clone();
         self.pending_settlement_handle = Some(tokio::spawn(async move {
-            let mut results = Vec::new();
-            for cid in to_poll {
-                let result = venue.get_market_resolution(&cid).await;
-                results.push((cid, result));
-            }
+            let result = tokio::time::timeout(SCAN_TIMEOUT, async {
+                let mut results = Vec::new();
+                for cid in &to_poll {
+                    let result = venue.get_market_resolution(cid).await;
+                    results.push((cid.clone(), result));
+                }
+                results
+            })
+            .await;
+
+            let results = match result {
+                Ok(r) => r,
+                Err(_) => {
+                    warn!(
+                        timeout_secs = SCAN_TIMEOUT.as_secs(),
+                        conditions = to_poll.len(),
+                        "settlement poll timed out"
+                    );
+                    Vec::new()
+                }
+            };
             if tx.send(results).await.is_err() {
                 debug!("settlement poll result dropped: receiver closed");
             }
@@ -1928,7 +1945,21 @@ impl TradingLoop {
         let scanner = self.scanner.clone();
         let tx = self.scan_result_tx.clone();
         self.pending_scan_handle = Some(tokio::spawn(async move {
-            let result = scanner.scan(venue.as_ref()).await;
+            let result = match tokio::time::timeout(SCAN_TIMEOUT, scanner.scan(venue.as_ref()))
+                .await
+            {
+                Ok(r) => r,
+                Err(_) => {
+                    warn!(
+                        timeout_secs = SCAN_TIMEOUT.as_secs(),
+                        "market scan timed out"
+                    );
+                    Err(ScannerError::GammaApi(format!(
+                        "scan timed out after {}s",
+                        SCAN_TIMEOUT.as_secs()
+                    )))
+                }
+            };
             if tx.send((scanned_at, result)).await.is_err() {
                 debug!("scan result dropped: receiver closed");
             }
