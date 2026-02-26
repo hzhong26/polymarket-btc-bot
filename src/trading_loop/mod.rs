@@ -52,7 +52,6 @@ const MARKET_WINDOW_TOLERANCE_SECS: i64 = 30;
 const PRICE_STARVATION_TIMEOUT: Duration = Duration::from_secs(30);
 const SCAN_TIMEOUT: Duration = Duration::from_secs(15);
 const RESOLUTION_POLL_INTERVAL_SECS: i64 = 5;
-const FORCE_SETTLE_TIMEOUT_SECS: i64 = 120;
 type ScanResultMsg = (
     chrono::DateTime<Utc>,
     Result<Vec<TargetMarket>, ScannerError>,
@@ -1574,73 +1573,6 @@ impl TradingLoop {
         );
     }
 
-    /// In paper mode, resolve an Up/Down market using our own spot price data
-    /// instead of waiting for Polymarket's Gamma API (which can lag ~10-12 min).
-    /// Returns `Some(MarketResolution)` when we have enough data to self-resolve.
-    fn try_self_resolve_updown(&self, condition_id: &str) -> Option<MarketResolution> {
-        let (asset, window_start) = match self.pnl_tracker.asset_and_window(condition_id) {
-            Some(v) => v,
-            None => {
-                warn!(
-                    condition_id = %condition_id,
-                    "self-resolve failed: position missing asset/window metadata"
-                );
-                return None;
-            }
-        };
-
-        // Get the reference (open) price — prefer official, fall back to our captured
-        let reference = match self
-            .pnl_tracker
-            .position_reference_price(condition_id)
-            .or_else(|| self.reference_cache.get(asset, window_start).map(|c| c.price))
-        {
-            Some(v) => v,
-            None => {
-                warn!(
-                    condition_id = %condition_id,
-                    asset = %asset,
-                    "self-resolve failed: no reference price (position or cache)"
-                );
-                return None;
-            }
-        };
-
-        // Get current spot price for the asset
-        let (_, spot) = match self.latest_spot_by_asset.get(&asset) {
-            Some(v) => v,
-            None => {
-                warn!(
-                    condition_id = %condition_id,
-                    asset = %asset,
-                    "self-resolve failed: no spot price for asset"
-                );
-                return None;
-            }
-        };
-
-        // Up/Down resolution: YES wins if price went up
-        let yes_won = *spot > reference;
-
-        info!(
-            condition_id = %condition_id,
-            asset = %asset,
-            reference = %reference,
-            spot = %spot,
-            yes_won,
-            "paper-mode self-resolution from spot price"
-        );
-
-        Some(MarketResolution {
-            condition_id: condition_id.to_string(),
-            resolved_yes_outcome: Some(yes_won),
-            official_final_price: Some(*spot),
-            official_price_to_beat: Some(reference),
-            resolved_at: Some(Utc::now()),
-            resolution_source: "self_resolve_spot".to_string(),
-        })
-    }
-
     /// Dispatch settlement resolution polling to a background task.
     /// Only the Gamma API network calls are spawned; everything else stays in the main loop.
     fn dispatch_settlement(&mut self, venue: Arc<dyn VenueClient>) {
@@ -1701,13 +1633,15 @@ impl TradingLoop {
     }
 
     /// Process the pre-fetched settlement poll results in the main loop.
+    /// Settlement uses only official Polymarket Gamma API resolutions — never
+    /// self-resolved from spot prices. Positions wait until Gamma resolves them.
     fn apply_settlement_results(&mut self, poll_results: SettlementPollMsg) {
         let now = Utc::now();
         let mut resolutions_by_condition: HashMap<String, MarketResolution> = HashMap::new();
 
         for (condition_id, result) in poll_results {
             match result {
-                Ok(Some(mut resolution)) => {
+                Ok(Some(resolution)) => {
                     // Post-hoc validation: compare captured reference to official price_to_beat
                     if let Some(official) = resolution.official_price_to_beat {
                         if let Some((asset, window_start)) =
@@ -1734,31 +1668,7 @@ impl TradingLoop {
 
                     if resolution.resolved_yes_outcome.is_some() {
                         self.resolution_poll_not_before.remove(&condition_id);
-                    } else if self.paper_mode {
-                        // Paper mode fast path: Gamma hasn't resolved yet, use our own
-                        // spot price to determine the outcome immediately.
-                        if let Some(self_resolution) =
-                            self.try_self_resolve_updown(&condition_id)
-                        {
-                            resolution.resolved_yes_outcome =
-                                self_resolution.resolved_yes_outcome;
-                            resolution.official_final_price =
-                                self_resolution.official_final_price;
-                            resolution.resolution_source =
-                                self_resolution.resolution_source;
-                            resolution.resolved_at = self_resolution.resolved_at;
-                            // Keep official_price_to_beat from Gamma if available
-                            if resolution.official_price_to_beat.is_none() {
-                                resolution.official_price_to_beat =
-                                    self_resolution.official_price_to_beat;
-                            }
-                            self.resolution_poll_not_before.remove(&condition_id);
-                        } else {
-                            self.resolution_poll_not_before.insert(
-                                condition_id.clone(),
-                                now + chrono::Duration::seconds(RESOLUTION_POLL_INTERVAL_SECS),
-                            );
-                        }
+                        resolutions_by_condition.insert(condition_id, resolution);
                     } else {
                         info!(
                             condition_id = %condition_id,
@@ -1766,22 +1676,12 @@ impl TradingLoop {
                             "resolution pending after expiry; waiting for official Polymarket outcome"
                         );
                         self.resolution_poll_not_before.insert(
-                            condition_id.clone(),
+                            condition_id,
                             now + chrono::Duration::seconds(RESOLUTION_POLL_INTERVAL_SECS),
                         );
                     }
-                    resolutions_by_condition.insert(condition_id, resolution);
                 }
                 Ok(None) => {
-                    // Market not found on Gamma yet.  In paper mode, self-resolve
-                    // immediately from our own spot price data.
-                    if self.paper_mode {
-                        if let Some(resolution) = self.try_self_resolve_updown(&condition_id) {
-                            self.resolution_poll_not_before.remove(&condition_id);
-                            resolutions_by_condition.insert(condition_id, resolution);
-                            continue;
-                        }
-                    }
                     info!(
                         condition_id = %condition_id,
                         now_et = %fmt_et_log_time(now),
@@ -1793,19 +1693,6 @@ impl TradingLoop {
                     );
                 }
                 Err(e) => {
-                    // API error.  In paper mode, self-resolve to avoid blocking.
-                    if self.paper_mode {
-                        if let Some(resolution) = self.try_self_resolve_updown(&condition_id) {
-                            self.resolution_poll_not_before.remove(&condition_id);
-                            resolutions_by_condition.insert(condition_id.clone(), resolution);
-                            warn!(
-                                condition_id = %condition_id,
-                                error = %e,
-                                "Gamma API failed, used paper-mode self-resolution"
-                            );
-                            continue;
-                        }
-                    }
                     warn!(
                         condition_id = %condition_id,
                         error = %e,
@@ -1824,44 +1711,12 @@ impl TradingLoop {
             SETTLEMENT_GRACE_SECS,
             &resolutions_by_condition,
         );
-
-        // Force-settle stuck positions that have been past expiry too long.
-        // This prevents indefinite capital lockup when self-resolve keeps failing.
-        let mut force_settled = Vec::new();
-        if self.paper_mode {
-            let due = self
-                .pnl_tracker
-                .due_condition_ids(now, SETTLEMENT_GRACE_SECS);
-            for cid in due {
-                // Skip conditions that were just settled normally
-                if resolutions_by_condition.contains_key(&cid) {
-                    continue;
-                }
-                if let Some(secs_past) = self.pnl_tracker.time_past_expiry(&cid) {
-                    if secs_past > FORCE_SETTLE_TIMEOUT_SECS {
-                        warn!(
-                            condition_id = %cid,
-                            seconds_past_expiry = secs_past,
-                            "force-settling stuck position as full loss after {}s timeout",
-                            FORCE_SETTLE_TIMEOUT_SECS,
-                        );
-                        if let Some(rec) = self.pnl_tracker.force_settle(&cid) {
-                            self.resolution_poll_not_before.remove(&cid);
-                            self.remove_dashboard_pending(&cid, "force_settled");
-                            force_settled.push(rec);
-                        }
-                    }
-                }
-            }
-        }
-
-        if settled.is_empty() && force_settled.is_empty() {
+        if settled.is_empty() {
             return;
         }
 
         let mode_label = if self.paper_mode { "paper" } else { "live" };
-        let all_settled: Vec<_> = settled.iter().chain(force_settled.iter()).collect();
-        for rec in &all_settled {
+        for rec in &settled {
             if let Some(cal) = self.calibration_by_asset.get_mut(&rec.asset) {
                 cal.record(
                     rec.model_yes_prob,
@@ -1878,14 +1733,9 @@ impl TradingLoop {
                     );
                 }
             }
-            let event_name = if rec.settlement_source == "force_settle_timeout" {
-                "force_settled"
-            } else {
-                "position_settled"
-            };
             let trade_payload = closed_trade_payload(rec);
             self.event_logger
-                .try_log_value(event_name, trade_payload.clone());
+                .try_log_value("position_settled", trade_payload.clone());
             // Dashboard: closed event
             let mut closed_msg = trade_payload.clone();
             if let serde_json::Value::Object(ref mut m) = closed_msg {
@@ -1896,28 +1746,18 @@ impl TradingLoop {
             if let Some(ref mut ts) = self.trade_sheet {
                 ts.record_closed(rec);
             }
-            if rec.settlement_source == "force_settle_timeout" {
-                warn!(
-                    asset = %rec.asset,
-                    token_id = %rec.token_id,
-                    realized = %rec.realized_pnl,
-                    mode = mode_label,
-                    "position force-settled as loss (stuck past timeout)"
-                );
-            } else {
-                info!(
-                    asset = %rec.asset,
-                    token_id = %rec.token_id,
-                    realized = %rec.realized_pnl,
-                    actual_yes = rec.actual_yes_outcome,
-                    mode = mode_label,
-                    "position settled"
-                );
-            }
+            info!(
+                asset = %rec.asset,
+                token_id = %rec.token_id,
+                realized = %rec.realized_pnl,
+                actual_yes = rec.actual_yes_outcome,
+                mode = mode_label,
+                "position settled"
+            );
         }
 
         // Prune reference cache for settled markets
-        let settled_keys: Vec<_> = all_settled
+        let settled_keys: Vec<_> = settled
             .iter()
             .filter_map(|s| {
                 let asset = s.asset;
@@ -1928,8 +1768,7 @@ impl TradingLoop {
 
         if self.dashboard_enabled {
             let snapshot = self.pnl_tracker.snapshot();
-            let all_owned: Vec<_> = settled.iter().chain(force_settled.iter()).cloned().collect();
-            print_pnl_dashboard(&snapshot, mode_label, "settlement", Some(&all_owned));
+            print_pnl_dashboard(&snapshot, mode_label, "settlement", Some(&settled));
             let snap_payload = pnl_snapshot_payload(&snapshot, "settlement");
             self.push_dashboard_snap(
                 &snap_payload,
