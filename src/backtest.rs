@@ -36,6 +36,9 @@ struct BacktestEval {
     // Book snapshot for P&L estimation
     best_bid: Option<f64>,
     best_ask: Option<f64>,
+    // P6: OBI data for re-application
+    obi_raw: Option<f64>,
+    posterior_pre_obi: Option<f64>,
     // Original action
     action_kind: String,
     was_sampled: bool,
@@ -53,6 +56,9 @@ struct SweepParams {
     min_time_to_expiry_secs: f64,
     max_net_edge: Option<f64>,
     asset_edge_mults: HashMap<String, f64>,
+    /// P6: OBI weight (for future sweep; not re-applied since logged posteriors include OBI).
+    #[allow(dead_code)]
+    obi_weight: f64,
 }
 
 /// Results from running one sweep configuration.
@@ -170,6 +176,8 @@ fn parse_backtest_eval(val: &serde_json::Value) -> Option<BacktestEval> {
     let time_to_expiry_secs = mc.get("time_to_expiry_secs")?.as_f64()?;
     let posterior = mc.get("posterior").and_then(|v| v.as_f64());
     let market_implied_p = mc.get("market_implied_p").and_then(|v| v.as_f64());
+    let obi_raw = mc.get("obi_raw").and_then(|v| v.as_f64());
+    let posterior_pre_obi = mc.get("posterior_pre_obi").and_then(|v| v.as_f64());
 
     let cc = p.get("cost_context")?;
     let gross_edge = cc.get("gross_edge").and_then(|v| v.as_f64());
@@ -215,6 +223,8 @@ fn parse_backtest_eval(val: &serde_json::Value) -> Option<BacktestEval> {
         stake_usdc,
         best_bid,
         best_ask,
+        obi_raw,
+        posterior_pre_obi,
         action_kind,
         was_sampled,
         sample_rate,
@@ -271,21 +281,44 @@ fn run_sweep(
             continue;
         };
 
-        // 3. Probability shrinkage
-        let shrunk_posterior = if let Some(alpha) = params.prob_shrinkage_alpha {
-            let market_p = eval.market_implied_p.unwrap_or(posterior);
-            (alpha * posterior + (1.0 - alpha) * market_p).clamp(0.001, 0.999)
-        } else {
-            posterior
+        // 3. OBI re-application: start from pre-OBI posterior if available,
+        //    apply sweep OBI weight, then shrinkage.
+        let obi_adjusted_posterior = {
+            // Use pre-OBI posterior if logged (new logs); fall back to final posterior (old logs).
+            let base_p = eval.posterior_pre_obi.unwrap_or(posterior);
+            if params.obi_weight > 0.0 {
+                if let Some(imbalance) = eval.obi_raw {
+                    if base_p > 0.001 && base_p < 0.999 {
+                        let lo = (base_p / (1.0 - base_p)).ln();
+                        let adj = lo + params.obi_weight * imbalance;
+                        (1.0 / (1.0 + (-adj).exp())).clamp(0.001, 0.999)
+                    } else {
+                        base_p
+                    }
+                } else {
+                    base_p
+                }
+            } else {
+                base_p
+            }
         };
 
-        // 4. Recompute edge with shrunk posterior
-        let new_net_edge = if params.prob_shrinkage_alpha.is_some() {
+        // 4. Probability shrinkage (after OBI, matching pipeline order)
+        let shrunk_posterior = if let Some(alpha) = params.prob_shrinkage_alpha {
+            let market_p = eval.market_implied_p.unwrap_or(obi_adjusted_posterior);
+            (alpha * obi_adjusted_posterior + (1.0 - alpha) * market_p).clamp(0.001, 0.999)
+        } else {
+            obi_adjusted_posterior
+        };
+
+        // 5. Recompute edge from adjusted posterior when OBI or shrinkage changed it.
+        let needs_recompute = params.prob_shrinkage_alpha.is_some()
+            || (params.obi_weight > 0.0 && eval.posterior_pre_obi.is_some());
+        let new_net_edge = if needs_recompute {
             let is_buy_yes = edge_side.contains("YES");
             let new_gross = if is_buy_yes {
                 shrunk_posterior - executable_price
             } else {
-                // BUY NO: (1 - posterior) is our NO prob, entry is (1 - best_bid)
                 let no_entry = eval.best_bid.map(|b| 1.0 - b).unwrap_or(executable_price);
                 (1.0 - shrunk_posterior) - no_entry
             };
@@ -435,6 +468,7 @@ fn build_default_grid(cfg: &config::TradingConfig) -> Vec<SweepParams> {
     let base_tte = cfg.min_time_to_expiry_secs as f64;
     let base_max_edge = cfg.max_net_edge.and_then(|v| v.to_f64());
     let base_shrinkage = cfg.prob_shrinkage_alpha;
+    let base_obi_weight = cfg.obi_weight;
 
     // Collect per-asset edge multipliers from config
     let asset_mults: HashMap<String, f64> = [
@@ -464,6 +498,7 @@ fn build_default_grid(cfg: &config::TradingConfig) -> Vec<SweepParams> {
         min_time_to_expiry_secs: base_tte,
         max_net_edge: base_max_edge,
         asset_edge_mults: asset_mults.clone(),
+        obi_weight: base_obi_weight,
     });
 
     // Edge threshold sweep
@@ -480,6 +515,7 @@ fn build_default_grid(cfg: &config::TradingConfig) -> Vec<SweepParams> {
             min_time_to_expiry_secs: base_tte,
             max_net_edge: base_max_edge,
             asset_edge_mults: asset_mults.clone(),
+            obi_weight: 0.0,
         });
     }
 
@@ -494,6 +530,7 @@ fn build_default_grid(cfg: &config::TradingConfig) -> Vec<SweepParams> {
             min_time_to_expiry_secs: base_tte,
             max_net_edge: base_max_edge,
             asset_edge_mults: asset_mults.clone(),
+            obi_weight: 0.0,
         });
     }
 
@@ -511,6 +548,7 @@ fn build_default_grid(cfg: &config::TradingConfig) -> Vec<SweepParams> {
             min_time_to_expiry_secs: tte,
             max_net_edge: base_max_edge,
             asset_edge_mults: asset_mults.clone(),
+            obi_weight: 0.0,
         });
     }
 
@@ -535,6 +573,7 @@ fn build_default_grid(cfg: &config::TradingConfig) -> Vec<SweepParams> {
             min_time_to_expiry_secs: base_tte,
             max_net_edge: base_max_edge,
             asset_edge_mults: asset_mults.clone(),
+            obi_weight: 0.0,
         });
     }
 
@@ -553,6 +592,25 @@ fn build_default_grid(cfg: &config::TradingConfig) -> Vec<SweepParams> {
             min_time_to_expiry_secs: base_tte,
             max_net_edge: Some(cap),
             asset_edge_mults: asset_mults.clone(),
+            obi_weight: 0.0,
+        });
+    }
+
+    // OBI weight sweep
+    for &w in &[0.0, 0.05, 0.15, 0.2, 0.3] {
+        if (w - base_obi_weight).abs() < 0.001 {
+            continue;
+        }
+        grid.push(SweepParams {
+            label: format!("obi={:.2}", w),
+            edge_threshold: base_edge,
+            yes_edge_threshold_mult: base_yes_mult,
+            no_edge_threshold_mult: base_no_mult,
+            prob_shrinkage_alpha: base_shrinkage,
+            min_time_to_expiry_secs: base_tte,
+            max_net_edge: base_max_edge,
+            asset_edge_mults: asset_mults.clone(),
+            obi_weight: w,
         });
     }
 
@@ -566,6 +624,7 @@ fn build_default_grid(cfg: &config::TradingConfig) -> Vec<SweepParams> {
         min_time_to_expiry_secs: 120.0,
         max_net_edge: Some(0.20),
         asset_edge_mults: asset_mults.clone(),
+        obi_weight: 0.0,
     });
 
     grid.push(SweepParams {
@@ -577,6 +636,7 @@ fn build_default_grid(cfg: &config::TradingConfig) -> Vec<SweepParams> {
         min_time_to_expiry_secs: base_tte,
         max_net_edge: base_max_edge,
         asset_edge_mults: asset_mults.clone(),
+        obi_weight: 0.0,
     });
 
     grid
@@ -859,6 +919,8 @@ mod tests {
             stake_usdc: Some(50.0),
             best_bid: Some(0.50),
             best_ask: Some(0.51),
+            obi_raw: None,
+            posterior_pre_obi: None,
             action_kind: action.to_string(),
             was_sampled: true,
             sample_rate: None,
@@ -901,6 +963,7 @@ mod tests {
             min_time_to_expiry_secs: 60.0,
             max_net_edge: None,
             asset_edge_mults: HashMap::new(),
+            obi_weight: 0.0,
         };
 
         let result = run_sweep(&params, &evals, &settled);
@@ -930,6 +993,7 @@ mod tests {
             min_time_to_expiry_secs: 60.0,
             max_net_edge: None,
             asset_edge_mults: HashMap::new(),
+            obi_weight: 0.0,
         };
 
         let result = run_sweep(&params, &evals, &settled);
@@ -957,6 +1021,7 @@ mod tests {
             min_time_to_expiry_secs: 120.0,
             max_net_edge: None,
             asset_edge_mults: HashMap::new(),
+            obi_weight: 0.0,
         };
 
         let result = run_sweep(&params, &evals, &settled);
@@ -989,6 +1054,7 @@ mod tests {
             min_time_to_expiry_secs: 60.0,
             max_net_edge: None,
             asset_edge_mults: HashMap::new(),
+            obi_weight: 0.0,
         };
 
         let result = run_sweep(&params, &evals, &settled);

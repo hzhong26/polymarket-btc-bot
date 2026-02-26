@@ -3,6 +3,7 @@ pub mod us;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 
 use crate::market_scanner::TargetMarket;
@@ -114,6 +115,35 @@ impl OrderBook {
 
         let avg_price = total_cost / size;
         Some(avg_price - best_ask)
+    }
+
+    /// Compute bid/ask volume imbalance over top `depth` levels.
+    /// Returns value in [-1.0, +1.0]. Positive = bid-heavy (bullish YES).
+    /// depth=0 means use all levels.
+    pub fn orderbook_imbalance(&self, depth: usize) -> Option<f64> {
+        let bid_slice = if depth > 0 {
+            &self.bids[..depth.min(self.bids.len())]
+        } else {
+            &self.bids[..]
+        };
+        let ask_slice = if depth > 0 {
+            &self.asks[..depth.min(self.asks.len())]
+        } else {
+            &self.asks[..]
+        };
+        let bid_vol: f64 = bid_slice
+            .iter()
+            .filter_map(|l| l.size.to_f64())
+            .sum();
+        let ask_vol: f64 = ask_slice
+            .iter()
+            .filter_map(|l| l.size.to_f64())
+            .sum();
+        let total = bid_vol + ask_vol;
+        if total <= 0.0 {
+            return None;
+        }
+        Some((bid_vol - ask_vol) / total)
     }
 
     /// Estimate slippage cost for selling `size` units.
@@ -238,4 +268,83 @@ pub trait VenueClient: Send + Sync {
 
     /// Which venue type this client represents.
     fn venue_type(&self) -> VenueType;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_book(bids: &[(f64, f64)], asks: &[(f64, f64)]) -> OrderBook {
+        OrderBook {
+            token_id: "test".into(),
+            bids: bids
+                .iter()
+                .map(|(p, s)| OrderBookLevel {
+                    price: Decimal::try_from(*p).unwrap(),
+                    size: Decimal::try_from(*s).unwrap(),
+                })
+                .collect(),
+            asks: asks
+                .iter()
+                .map(|(p, s)| OrderBookLevel {
+                    price: Decimal::try_from(*p).unwrap(),
+                    size: Decimal::try_from(*s).unwrap(),
+                })
+                .collect(),
+            tick_size: Decimal::new(1, 2),
+            min_order_size: Decimal::ONE,
+            neg_risk: false,
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn obi_balanced_book_returns_zero() {
+        let book = make_book(&[(0.50, 100.0), (0.49, 100.0)], &[(0.51, 100.0), (0.52, 100.0)]);
+        let obi = book.orderbook_imbalance(0).unwrap();
+        assert!((obi - 0.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn obi_bid_heavy_returns_positive() {
+        let book = make_book(&[(0.50, 200.0)], &[(0.51, 100.0)]);
+        let obi = book.orderbook_imbalance(0).unwrap();
+        // (200 - 100) / (200 + 100) = 1/3
+        assert!((obi - 1.0 / 3.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn obi_ask_heavy_returns_negative() {
+        let book = make_book(&[(0.50, 50.0)], &[(0.51, 150.0)]);
+        let obi = book.orderbook_imbalance(0).unwrap();
+        // (50 - 150) / (50 + 150) = -0.5
+        assert!((obi - (-0.5)).abs() < 1e-10);
+    }
+
+    #[test]
+    fn obi_depth_limits_levels() {
+        let book = make_book(
+            &[(0.50, 100.0), (0.49, 900.0)],
+            &[(0.51, 100.0), (0.52, 900.0)],
+        );
+        // depth=1: only top level, balanced
+        let obi1 = book.orderbook_imbalance(1).unwrap();
+        assert!((obi1 - 0.0).abs() < 1e-10);
+        // depth=0 (all levels): still balanced
+        let obi0 = book.orderbook_imbalance(0).unwrap();
+        assert!((obi0 - 0.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn obi_empty_book_returns_none() {
+        let book = make_book(&[], &[]);
+        assert!(book.orderbook_imbalance(5).is_none());
+    }
+
+    #[test]
+    fn obi_one_side_empty_returns_extreme() {
+        let book = make_book(&[(0.50, 100.0)], &[]);
+        let obi = book.orderbook_imbalance(5).unwrap();
+        assert!((obi - 1.0).abs() < 1e-10);
+    }
 }

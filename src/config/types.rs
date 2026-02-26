@@ -142,6 +142,12 @@ pub struct TradingConfig {
     /// 1.0 = pure model (no shrinkage), 0.5 = 50/50. None = disabled (same as 1.0).
     #[serde(default)]
     pub prob_shrinkage_alpha: Option<f64>,
+    /// P6: Orderbook imbalance weight in log-odds space. 0.0 = disabled.
+    #[serde(default)]
+    pub obi_weight: f64,
+    /// P6: Number of orderbook levels to include (0 = all levels).
+    #[serde(default = "default_obi_depth_levels")]
+    pub obi_depth_levels: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -250,6 +256,10 @@ fn default_fee_exponent() -> u32 {
 
 fn default_multiplier() -> Decimal {
     Decimal::ONE
+}
+
+fn default_obi_depth_levels() -> usize {
+    5
 }
 
 #[derive(Debug, Clone, Deserialize)]

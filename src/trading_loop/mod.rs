@@ -1227,6 +1227,8 @@ impl TradingLoop {
                 self.config.yes_edge_threshold_mult.to_f64().unwrap_or(1.0),
                 self.config.no_edge_threshold_mult.to_f64().unwrap_or(1.0),
                 self.config.prob_shrinkage_alpha,
+                self.config.obi_weight,
+                self.config.obi_depth_levels,
             );
             let is_no_trade = matches!(result.action, PipelineAction::NoTrade { .. });
             let was_sampled = if is_no_trade {

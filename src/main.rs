@@ -724,6 +724,8 @@ mod tests {
                 yes_edge_threshold_mult: Decimal::ONE,
                 no_edge_threshold_mult: Decimal::ONE,
                 prob_shrinkage_alpha: None,
+                obi_weight: 0.0,
+                obi_depth_levels: 5,
             },
             risk: config::RiskConfig {
                 max_position_usdc: Decimal::from(500),

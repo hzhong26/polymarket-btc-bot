@@ -65,6 +65,9 @@ pub struct PipelineDiagnostics {
     pub prob_pre_shrinkage: Option<f64>,
     pub prob_post_shrinkage: Option<f64>,
     pub prob_shrinkage_alpha: Option<f64>,
+    pub obi_raw: Option<f64>,
+    pub obi_adjustment: Option<f64>,
+    pub posterior_pre_obi: Option<f64>,
 }
 
 /// What action (if any) should be taken for this market.
@@ -150,6 +153,8 @@ pub fn evaluate_market(
     yes_edge_threshold_mult: f64,
     no_edge_threshold_mult: f64,
     prob_shrinkage_alpha: Option<f64>,
+    obi_weight: f64,
+    obi_depth_levels: usize,
 ) -> PipelineResult {
     let market_asset = PriceAsset::from_market_question(&market.question);
     let aggregated_spot = price.spot_usd.to_f64();
@@ -199,6 +204,9 @@ pub fn evaluate_market(
         prob_pre_shrinkage: None,
         prob_post_shrinkage: None,
         prob_shrinkage_alpha: None,
+        obi_raw: None,
+        obi_adjustment: None,
+        posterior_pre_obi: None,
     };
 
     if let Some(asset) = market_asset {
@@ -318,6 +326,21 @@ pub fn evaluate_market(
     }
 
     let mut posterior = posterior_details.adjusted_posterior;
+
+    // P6: Orderbook imbalance adjustment in log-odds space.
+    let obi_raw = book.orderbook_imbalance(obi_depth_levels);
+    diagnostics.obi_raw = obi_raw;
+    diagnostics.posterior_pre_obi = Some(posterior);
+    if let Some(imbalance) = obi_raw {
+        if obi_weight > 0.0 && posterior > 0.001 && posterior < 0.999 {
+            let log_odds = (posterior / (1.0 - posterior)).ln();
+            let adjusted_log_odds = log_odds + obi_weight * imbalance;
+            let pre_obi = posterior;
+            posterior = 1.0 / (1.0 + (-adjusted_log_odds).exp());
+            posterior = posterior.clamp(0.001, 0.999);
+            diagnostics.obi_adjustment = Some(posterior - pre_obi);
+        }
+    }
 
     // P9: Probability shrinkage toward market-implied price.
     if let Some(alpha) = prob_shrinkage_alpha {

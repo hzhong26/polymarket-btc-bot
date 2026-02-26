@@ -474,6 +474,9 @@ pub fn pipeline_payload(
             "prob_pre_shrinkage": d.prob_pre_shrinkage,
             "prob_post_shrinkage": d.prob_post_shrinkage,
             "prob_shrinkage_alpha": d.prob_shrinkage_alpha,
+            "obi_raw": d.obi_raw,
+            "obi_adjustment": d.obi_adjustment,
+            "posterior_pre_obi": d.posterior_pre_obi,
         },
         "execution_context": {
             "orderbook": orderbook_payload(book, depth_levels),
