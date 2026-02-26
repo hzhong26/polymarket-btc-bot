@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
-use rust_xlsxwriter::{Color, Format, Workbook};
+use rust_xlsxwriter::{Color, Format, Workbook, Worksheet};
 
 use crate::timezone::to_et;
 use crate::trading_loop::pnl::{ClosedTradeRecord, OutcomeTokenSide};
@@ -438,144 +438,53 @@ impl TradeSheetWriter {
             let analysis = workbook.add_worksheet();
             let _ = analysis.set_name("Analysis");
 
-            let coins = ordered_coins(&closed);
             let mut arow: u32 = 0;
 
-            // ── Totals table ─────────────────────────────────────────────
-            let total = closed.len();
-            let wins = closed.iter().filter(|r| r.won == Some(true)).count();
-            let losses = total - wins;
-            let win_pct = wins as f64 / total as f64;
-
-            let total_pnl: f64 = closed
-                .iter()
-                .filter_map(|r| r.realized_pnl.and_then(|v| v.to_f64()))
-                .sum();
-            let total_staked: f64 = closed.iter().filter_map(|r| r.kelly_stake_usdc).sum();
-            let total_fee: f64 = closed
-                .iter()
-                .filter_map(|r| match (r.cost_fee_rate, r.kelly_stake_usdc) {
-                    (Some(rate), Some(stake)) => Some(rate * stake),
-                    _ => None,
-                })
-                .sum();
-            let roi_pct = if total_staked > 0.0 { total_pnl / total_staked } else { 0.0 };
-            let net_profit = total_pnl - total_fee;
-
-            let _ = analysis.merge_range(arow, 0, arow, 7, "Totals", &fmt_section_header);
-            arow += 1;
-            let totals_headers = ["Trades", "Wins", "Losses", "Win %", "Total P&L", "ROI %", "Fees", "Net Profit"];
-            for (c, &h) in totals_headers.iter().enumerate() {
-                let _ = analysis.write_string_with_format(arow, c as u16, h, &fmt_bold);
-            }
-            arow += 1;
-            let _ = analysis.write_number(arow, 0, total as f64);
-            let _ = analysis.write_number(arow, 1, wins as f64);
-            let _ = analysis.write_number(arow, 2, losses as f64);
-            let _ = analysis.write_number_with_format(arow, 3, win_pct, &fmt_pct);
-            let pnl_fmt = if total_pnl >= 0.0 { &fmt_pnl_pos } else { &fmt_pnl_neg };
-            let _ = analysis.write_number_with_format(arow, 4, total_pnl, pnl_fmt);
-            let _ = analysis.write_number_with_format(arow, 5, roi_pct, &fmt_pct);
-            let _ = analysis.write_number_with_format(arow, 6, total_fee, &fmt_dollar);
-            let np_fmt = if net_profit >= 0.0 { &fmt_pnl_pos } else { &fmt_pnl_neg };
-            let _ = analysis.write_number_with_format(arow, 7, net_profit, np_fmt);
-            arow += 2;
-
-            // ── Win Rate by Coin ─────────────────────────────────────────
-            let _ = analysis.merge_range(arow, 0, arow, 3, "Win Rate by Coin", &fmt_section_header);
-            arow += 1;
-            let wr_headers = ["Coin", "Wins", "Losses", "Win %"];
-            for (c, &h) in wr_headers.iter().enumerate() {
-                let _ = analysis.write_string_with_format(arow, c as u16, h, &fmt_bold);
-            }
-            arow += 1;
-            for coin in &coins {
-                let subset: Vec<&&TradeRow> = closed.iter().filter(|r| r.coin == *coin).collect();
-                let c_total = subset.len();
-                let c_wins = subset.iter().filter(|r| r.won == Some(true)).count();
-                let c_wr = c_wins as f64 / c_total as f64;
-                let _ = analysis.write_string(arow, 0, coin);
-                let _ = analysis.write_number(arow, 1, c_wins as f64);
-                let _ = analysis.write_number(arow, 2, (c_total - c_wins) as f64);
-                let _ = analysis.write_number_with_format(arow, 3, c_wr, &fmt_pct);
-                arow += 1;
-            }
-            arow += 1;
-
-            // ── P&L by Coin ──────────────────────────────────────────────
-            let _ = analysis.merge_range(arow, 0, arow, 3, "P&L by Coin", &fmt_section_header);
-            arow += 1;
-            let pnl_headers = ["Coin", "Total P&L", "Staked", "ROI %"];
-            for (c, &h) in pnl_headers.iter().enumerate() {
-                let _ = analysis.write_string_with_format(arow, c as u16, h, &fmt_bold);
-            }
-            arow += 1;
-            for coin in &coins {
-                let subset: Vec<&&TradeRow> = closed.iter().filter(|r| r.coin == *coin).collect();
-                let c_pnl: f64 = subset
-                    .iter()
-                    .filter_map(|r| r.realized_pnl.and_then(|v| v.to_f64()))
-                    .sum();
-                let c_staked: f64 = subset.iter().filter_map(|r| r.kelly_stake_usdc).sum();
-                let c_roi = if c_staked > 0.0 { c_pnl / c_staked } else { 0.0 };
-                let _ = analysis.write_string(arow, 0, coin);
-                let cpnl_fmt = if c_pnl >= 0.0 { &fmt_pnl_pos } else { &fmt_pnl_neg };
-                let _ = analysis.write_number_with_format(arow, 1, c_pnl, cpnl_fmt);
-                let _ = analysis.write_number_with_format(arow, 2, c_staked, &fmt_dollar);
-                let _ = analysis.write_number_with_format(arow, 3, c_roi, &fmt_pct);
-                arow += 1;
-            }
-            arow += 1;
-
-            // ── Coin x Timeframe ─────────────────────────────────────────
-            let _ = analysis.merge_range(arow, 0, arow, 5, "Coin x Timeframe", &fmt_section_header);
-            arow += 1;
-            let ct_headers = ["Coin", "Timeframe", "Wins", "Losses", "Win %", "Total P&L"];
-            for (c, &h) in ct_headers.iter().enumerate() {
-                let _ = analysis.write_string_with_format(arow, c as u16, h, &fmt_bold);
-            }
-            arow += 1;
-            for coin in &coins {
-                let subset: Vec<&&TradeRow> = closed.iter().filter(|r| r.coin == *coin).collect();
-                let timeframes = ordered_timeframes(&subset);
-                for tf in &timeframes {
-                    let tf_sub: Vec<&&&TradeRow> = subset
+            if run_numbers.len() >= 2 {
+                // Per-run analysis blocks
+                for &run_num in &run_numbers {
+                    let run_closed: Vec<&TradeRow> = closed
                         .iter()
-                        .filter(|r| fmt_timeframe(r.end_time, r.window_start) == *tf)
+                        .filter(|r| r.run_number == run_num)
+                        .copied()
                         .collect();
-                    let t_total = tf_sub.len();
-                    let t_wins = tf_sub.iter().filter(|r| r.won == Some(true)).count();
-                    let t_wr = t_wins as f64 / t_total as f64;
-                    let t_pnl: f64 = tf_sub
-                        .iter()
-                        .filter_map(|r| r.realized_pnl.and_then(|v| v.to_f64()))
-                        .sum();
-                    let _ = analysis.write_string(arow, 0, coin);
-                    let _ = analysis.write_string(arow, 1, tf);
-                    let _ = analysis.write_number(arow, 2, t_wins as f64);
-                    let _ = analysis.write_number(arow, 3, (t_total - t_wins) as f64);
-                    let _ = analysis.write_number_with_format(arow, 4, t_wr, &fmt_pct);
-                    let tpnl_fmt = if t_pnl >= 0.0 { &fmt_pnl_pos } else { &fmt_pnl_neg };
-                    let _ = analysis.write_number_with_format(arow, 5, t_pnl, tpnl_fmt);
-                    arow += 1;
-                }
-            }
-            arow += 1;
+                    if run_closed.is_empty() {
+                        continue;
+                    }
 
-            // ── Cumulative P&L ───────────────────────────────────────────
-            let cum_pnls = cumulative_pnls(&closed);
-            if cum_pnls.len() >= 2 {
-                let _ = analysis.merge_range(arow, 0, arow, 1, "Cumulative P&L", &fmt_section_header);
-                arow += 1;
-                let _ = analysis.write_string_with_format(arow, 0, "Trade #", &fmt_bold);
-                let _ = analysis.write_string_with_format(arow, 1, "Cumulative P&L", &fmt_bold);
-                arow += 1;
-                for (i, cum) in cum_pnls.iter().enumerate() {
-                    let _ = analysis.write_number(arow, 0, (i + 1) as f64);
-                    let cfmt = if *cum >= 0.0 { &fmt_pnl_pos } else { &fmt_pnl_neg };
-                    let _ = analysis.write_number_with_format(arow, 1, *cum, cfmt);
+                    let version = self
+                        .run_versions
+                        .iter()
+                        .find(|(n, _)| *n == run_num)
+                        .map(|(_, v)| v.as_str())
+                        .unwrap_or("?");
+                    let label = format!("Run {} (v{})", run_num, version);
+                    let _ = analysis.merge_range(arow, 0, arow, 7, &label, &fmt_run_header);
                     arow += 1;
+
+                    arow = write_analysis_block(
+                        analysis, arow, &run_closed,
+                        &fmt_section_header, &fmt_bold, &fmt_pct,
+                        &fmt_pnl_pos, &fmt_pnl_neg, &fmt_dollar,
+                    );
+                    arow += 1; // blank row separator
                 }
+
+                // All Runs combined
+                let _ = analysis.merge_range(arow, 0, arow, 7, "All Runs", &fmt_run_header);
+                arow += 1;
+                write_analysis_block(
+                    analysis, arow, &closed,
+                    &fmt_section_header, &fmt_bold, &fmt_pct,
+                    &fmt_pnl_pos, &fmt_pnl_neg, &fmt_dollar,
+                );
+            } else {
+                // Single run — write analysis exactly as before (no run header)
+                write_analysis_block(
+                    analysis, arow, &closed,
+                    &fmt_section_header, &fmt_bold, &fmt_pct,
+                    &fmt_pnl_pos, &fmt_pnl_neg, &fmt_dollar,
+                );
             }
 
             // Set column widths for analysis sheet
@@ -591,6 +500,167 @@ impl TradeSheetWriter {
 
         workbook.save_to_buffer().unwrap_or_default()
     }
+}
+
+/// Write the 5 analysis sections (Totals, Win Rate by Coin, P&L by Coin,
+/// Coin x Timeframe, Cumulative P&L) starting at `start_row`. Returns the
+/// next available row.
+fn write_analysis_block(
+    ws: &mut Worksheet,
+    start_row: u32,
+    closed: &[&TradeRow],
+    fmt_section_header: &Format,
+    fmt_bold: &Format,
+    fmt_pct: &Format,
+    fmt_pnl_pos: &Format,
+    fmt_pnl_neg: &Format,
+    fmt_dollar: &Format,
+) -> u32 {
+    if closed.is_empty() {
+        return start_row;
+    }
+
+    let coins = ordered_coins(closed);
+    let mut arow = start_row;
+
+    // ── Totals table ─────────────────────────────────────────────
+    let total = closed.len();
+    let wins = closed.iter().filter(|r| r.won == Some(true)).count();
+    let losses = total - wins;
+    let win_pct = wins as f64 / total as f64;
+
+    let total_pnl: f64 = closed
+        .iter()
+        .filter_map(|r| r.realized_pnl.and_then(|v| v.to_f64()))
+        .sum();
+    let total_staked: f64 = closed.iter().filter_map(|r| r.kelly_stake_usdc).sum();
+    let total_fee: f64 = closed
+        .iter()
+        .filter_map(|r| match (r.cost_fee_rate, r.kelly_stake_usdc) {
+            (Some(rate), Some(stake)) => Some(rate * stake),
+            _ => None,
+        })
+        .sum();
+    let roi_pct = if total_staked > 0.0 { total_pnl / total_staked } else { 0.0 };
+    let net_profit = total_pnl - total_fee;
+
+    let _ = ws.merge_range(arow, 0, arow, 7, "Totals", fmt_section_header);
+    arow += 1;
+    let totals_headers = ["Trades", "Wins", "Losses", "Win %", "Total P&L", "ROI %", "Fees", "Net Profit"];
+    for (c, &h) in totals_headers.iter().enumerate() {
+        let _ = ws.write_string_with_format(arow, c as u16, h, fmt_bold);
+    }
+    arow += 1;
+    let _ = ws.write_number(arow, 0, total as f64);
+    let _ = ws.write_number(arow, 1, wins as f64);
+    let _ = ws.write_number(arow, 2, losses as f64);
+    let _ = ws.write_number_with_format(arow, 3, win_pct, fmt_pct);
+    let pnl_fmt = if total_pnl >= 0.0 { fmt_pnl_pos } else { fmt_pnl_neg };
+    let _ = ws.write_number_with_format(arow, 4, total_pnl, pnl_fmt);
+    let _ = ws.write_number_with_format(arow, 5, roi_pct, fmt_pct);
+    let _ = ws.write_number_with_format(arow, 6, total_fee, fmt_dollar);
+    let np_fmt = if net_profit >= 0.0 { fmt_pnl_pos } else { fmt_pnl_neg };
+    let _ = ws.write_number_with_format(arow, 7, net_profit, np_fmt);
+    arow += 2;
+
+    // ── Win Rate by Coin ─────────────────────────────────────────
+    let _ = ws.merge_range(arow, 0, arow, 3, "Win Rate by Coin", fmt_section_header);
+    arow += 1;
+    let wr_headers = ["Coin", "Wins", "Losses", "Win %"];
+    for (c, &h) in wr_headers.iter().enumerate() {
+        let _ = ws.write_string_with_format(arow, c as u16, h, fmt_bold);
+    }
+    arow += 1;
+    for coin in &coins {
+        let subset: Vec<&&TradeRow> = closed.iter().filter(|r| r.coin == *coin).collect();
+        let c_total = subset.len();
+        let c_wins = subset.iter().filter(|r| r.won == Some(true)).count();
+        let c_wr = c_wins as f64 / c_total as f64;
+        let _ = ws.write_string(arow, 0, coin);
+        let _ = ws.write_number(arow, 1, c_wins as f64);
+        let _ = ws.write_number(arow, 2, (c_total - c_wins) as f64);
+        let _ = ws.write_number_with_format(arow, 3, c_wr, fmt_pct);
+        arow += 1;
+    }
+    arow += 1;
+
+    // ── P&L by Coin ──────────────────────────────────────────────
+    let _ = ws.merge_range(arow, 0, arow, 3, "P&L by Coin", fmt_section_header);
+    arow += 1;
+    let pnl_headers = ["Coin", "Total P&L", "Staked", "ROI %"];
+    for (c, &h) in pnl_headers.iter().enumerate() {
+        let _ = ws.write_string_with_format(arow, c as u16, h, fmt_bold);
+    }
+    arow += 1;
+    for coin in &coins {
+        let subset: Vec<&&TradeRow> = closed.iter().filter(|r| r.coin == *coin).collect();
+        let c_pnl: f64 = subset
+            .iter()
+            .filter_map(|r| r.realized_pnl.and_then(|v| v.to_f64()))
+            .sum();
+        let c_staked: f64 = subset.iter().filter_map(|r| r.kelly_stake_usdc).sum();
+        let c_roi = if c_staked > 0.0 { c_pnl / c_staked } else { 0.0 };
+        let _ = ws.write_string(arow, 0, coin);
+        let cpnl_fmt = if c_pnl >= 0.0 { fmt_pnl_pos } else { fmt_pnl_neg };
+        let _ = ws.write_number_with_format(arow, 1, c_pnl, cpnl_fmt);
+        let _ = ws.write_number_with_format(arow, 2, c_staked, fmt_dollar);
+        let _ = ws.write_number_with_format(arow, 3, c_roi, fmt_pct);
+        arow += 1;
+    }
+    arow += 1;
+
+    // ── Coin x Timeframe ─────────────────────────────────────────
+    let _ = ws.merge_range(arow, 0, arow, 5, "Coin x Timeframe", fmt_section_header);
+    arow += 1;
+    let ct_headers = ["Coin", "Timeframe", "Wins", "Losses", "Win %", "Total P&L"];
+    for (c, &h) in ct_headers.iter().enumerate() {
+        let _ = ws.write_string_with_format(arow, c as u16, h, fmt_bold);
+    }
+    arow += 1;
+    for coin in &coins {
+        let subset: Vec<&&TradeRow> = closed.iter().filter(|r| r.coin == *coin).collect();
+        let timeframes = ordered_timeframes(&subset);
+        for tf in &timeframes {
+            let tf_sub: Vec<&&&TradeRow> = subset
+                .iter()
+                .filter(|r| fmt_timeframe(r.end_time, r.window_start) == *tf)
+                .collect();
+            let t_total = tf_sub.len();
+            let t_wins = tf_sub.iter().filter(|r| r.won == Some(true)).count();
+            let t_wr = t_wins as f64 / t_total as f64;
+            let t_pnl: f64 = tf_sub
+                .iter()
+                .filter_map(|r| r.realized_pnl.and_then(|v| v.to_f64()))
+                .sum();
+            let _ = ws.write_string(arow, 0, coin);
+            let _ = ws.write_string(arow, 1, tf);
+            let _ = ws.write_number(arow, 2, t_wins as f64);
+            let _ = ws.write_number(arow, 3, (t_total - t_wins) as f64);
+            let _ = ws.write_number_with_format(arow, 4, t_wr, fmt_pct);
+            let tpnl_fmt = if t_pnl >= 0.0 { fmt_pnl_pos } else { fmt_pnl_neg };
+            let _ = ws.write_number_with_format(arow, 5, t_pnl, tpnl_fmt);
+            arow += 1;
+        }
+    }
+    arow += 1;
+
+    // ── Cumulative P&L ───────────────────────────────────────────
+    let cum_pnls = cumulative_pnls(closed);
+    if cum_pnls.len() >= 2 {
+        let _ = ws.merge_range(arow, 0, arow, 1, "Cumulative P&L", fmt_section_header);
+        arow += 1;
+        let _ = ws.write_string_with_format(arow, 0, "Trade #", fmt_bold);
+        let _ = ws.write_string_with_format(arow, 1, "Cumulative P&L", fmt_bold);
+        arow += 1;
+        for (i, cum) in cum_pnls.iter().enumerate() {
+            let _ = ws.write_number(arow, 0, (i + 1) as f64);
+            let cfmt = if *cum >= 0.0 { fmt_pnl_pos } else { fmt_pnl_neg };
+            let _ = ws.write_number_with_format(arow, 1, *cum, cfmt);
+            arow += 1;
+        }
+    }
+
+    arow
 }
 
 pub(crate) fn fmt_timeframe(end: Option<DateTime<Utc>>, start: Option<DateTime<Utc>>) -> String {
