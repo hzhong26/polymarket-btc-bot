@@ -162,6 +162,7 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     let aggregated_tx_clone = aggregated_tx.clone();
+    drop(aggregated_tx); // Only the aggregator task owns the sender — if it exits, the channel closes
     let shutdown_agg = shutdown.clone();
     tokio::spawn(async move {
         let mut aggregator =

@@ -48,6 +48,7 @@ const SETTLEMENT_GRACE_SECS: i64 = 10;
 const SETTLEMENT_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const REFERENCE_CAPTURE_PROBE_INTERVAL: Duration = Duration::from_millis(500);
 const MARKET_WINDOW_TOLERANCE_SECS: i64 = 30;
+const PRICE_STARVATION_TIMEOUT: Duration = Duration::from_secs(30);
 const RESOLUTION_POLL_INTERVAL_SECS: i64 = 5;
 type ScanResultMsg = (
     chrono::DateTime<Utc>,
@@ -105,6 +106,7 @@ pub struct TradingLoop {
     drawdown_halt: Option<String>,
     dashboard_state: Option<SharedState>,
     trade_sheet: Option<trade_sheet::TradeSheetWriter>,
+    last_price_received: tokio::time::Instant,
 }
 
 impl TradingLoop {
@@ -196,6 +198,7 @@ impl TradingLoop {
             last_eligibility_snapshot_by_asset: HashMap::new(),
             drawdown_halt: None,
             dashboard_state: Some(dashboard_state),
+            last_price_received: tokio::time::Instant::now(),
         }
     }
 
@@ -282,6 +285,7 @@ impl TradingLoop {
                 result = price_rx.recv() => {
                     match result {
                         Ok(price) => {
+                            self.last_price_received = tokio::time::Instant::now();
                             self.handle_price_update(venue.as_ref(), &price).await;
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -386,6 +390,22 @@ impl TradingLoop {
                     let now = Utc::now();
                     self.capture_reference_prices_at(now).await;
                     self.last_reference_capture_probe = now;
+                }
+
+                // Branch 6b: Price feed starvation watchdog
+                _ = tokio::time::sleep_until(self.last_price_received + PRICE_STARVATION_TIMEOUT) => {
+                    error!(
+                        timeout_secs = PRICE_STARVATION_TIMEOUT.as_secs(),
+                        "no price update received — price feed may be dead"
+                    );
+                    self.event_logger.try_log_value(
+                        "price_starvation",
+                        serde_json::json!({
+                            "timeout_secs": PRICE_STARVATION_TIMEOUT.as_secs(),
+                            "last_price_age_secs": self.last_price_received.elapsed().as_secs(),
+                        }),
+                    );
+                    break "price_feed_starvation";
                 }
 
                 // Branch 7: Shutdown

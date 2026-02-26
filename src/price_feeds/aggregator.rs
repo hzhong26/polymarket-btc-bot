@@ -21,6 +21,7 @@ pub struct PriceAggregator {
     anomaly_deviation_pct: f64,
     min_sources_per_asset: usize,
     latest: HashMap<(FeedSource, PriceAsset), PriceObservation>,
+    last_quorum_warn: HashMap<PriceAsset, std::time::Instant>,
 }
 
 impl PriceAggregator {
@@ -36,6 +37,7 @@ impl PriceAggregator {
             anomaly_deviation_pct: anomaly_deviation_pct.to_f64().unwrap_or(2.0),
             min_sources_per_asset: min_sources_per_asset.max(1),
             latest: HashMap::new(),
+            last_quorum_warn: HashMap::new(),
         }
     }
 
@@ -55,7 +57,7 @@ impl PriceAggregator {
     /// 3. If Chainlink is available and valid, use it as BTC primary price
     /// 4. Confidence = based on agreement and number of sources (scaled to min_sources quorum)
     /// 5. Timestamp = freshest observation timestamp (not wall clock)
-    fn aggregate_for_asset(&self, asset: PriceAsset) -> Option<AggregatedPrice> {
+    fn aggregate_for_asset(&mut self, asset: PriceAsset) -> Option<AggregatedPrice> {
         let now = Utc::now();
 
         // Issue 6: Filter non-positive prices alongside staleness
@@ -123,12 +125,20 @@ impl PriceAggregator {
         let valid = candidates;
 
         if valid.len() < self.min_sources_per_asset {
-            debug!(
-                asset = %asset,
-                valid_sources = valid.len(),
-                required_sources = self.min_sources_per_asset,
-                "insufficient valid feed quorum for aggregation"
-            );
+            let now_inst = std::time::Instant::now();
+            let should_warn = self
+                .last_quorum_warn
+                .get(&asset)
+                .map_or(true, |last| now_inst.duration_since(*last) >= Duration::from_secs(10));
+            if should_warn {
+                warn!(
+                    asset = %asset,
+                    valid_sources = valid.len(),
+                    required_sources = self.min_sources_per_asset,
+                    "insufficient valid feed quorum for aggregation"
+                );
+                self.last_quorum_warn.insert(asset, now_inst);
+            }
             return None;
         }
 
@@ -300,7 +310,7 @@ mod tests {
 
     #[test]
     fn test_empty_aggregator() {
-        let agg = PriceAggregator::new(
+        let mut agg = PriceAggregator::new(
             Duration::from_secs(10),
             Duration::from_secs(45),
             Decimal::TWO,
