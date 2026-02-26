@@ -52,6 +52,7 @@ const MARKET_WINDOW_TOLERANCE_SECS: i64 = 30;
 const PRICE_STARVATION_TIMEOUT: Duration = Duration::from_secs(30);
 const SCAN_TIMEOUT: Duration = Duration::from_secs(15);
 const RESOLUTION_POLL_INTERVAL_SECS: i64 = 5;
+const FORCE_SETTLE_TIMEOUT_SECS: i64 = 120;
 type ScanResultMsg = (
     chrono::DateTime<Utc>,
     Result<Vec<TargetMarket>, ScannerError>,
@@ -1577,16 +1578,46 @@ impl TradingLoop {
     /// instead of waiting for Polymarket's Gamma API (which can lag ~10-12 min).
     /// Returns `Some(MarketResolution)` when we have enough data to self-resolve.
     fn try_self_resolve_updown(&self, condition_id: &str) -> Option<MarketResolution> {
-        let (asset, window_start) = self.pnl_tracker.asset_and_window(condition_id)?;
+        let (asset, window_start) = match self.pnl_tracker.asset_and_window(condition_id) {
+            Some(v) => v,
+            None => {
+                warn!(
+                    condition_id = %condition_id,
+                    "self-resolve failed: position missing asset/window metadata"
+                );
+                return None;
+            }
+        };
 
         // Get the reference (open) price — prefer official, fall back to our captured
-        let reference = self
+        let reference = match self
             .pnl_tracker
             .position_reference_price(condition_id)
-            .or_else(|| self.reference_cache.get(asset, window_start).map(|c| c.price))?;
+            .or_else(|| self.reference_cache.get(asset, window_start).map(|c| c.price))
+        {
+            Some(v) => v,
+            None => {
+                warn!(
+                    condition_id = %condition_id,
+                    asset = %asset,
+                    "self-resolve failed: no reference price (position or cache)"
+                );
+                return None;
+            }
+        };
 
         // Get current spot price for the asset
-        let (_, spot) = self.latest_spot_by_asset.get(&asset)?;
+        let (_, spot) = match self.latest_spot_by_asset.get(&asset) {
+            Some(v) => v,
+            None => {
+                warn!(
+                    condition_id = %condition_id,
+                    asset = %asset,
+                    "self-resolve failed: no spot price for asset"
+                );
+                return None;
+            }
+        };
 
         // Up/Down resolution: YES wins if price went up
         let yes_won = *spot > reference;
@@ -1793,12 +1824,44 @@ impl TradingLoop {
             SETTLEMENT_GRACE_SECS,
             &resolutions_by_condition,
         );
-        if settled.is_empty() {
+
+        // Force-settle stuck positions that have been past expiry too long.
+        // This prevents indefinite capital lockup when self-resolve keeps failing.
+        let mut force_settled = Vec::new();
+        if self.paper_mode {
+            let due = self
+                .pnl_tracker
+                .due_condition_ids(now, SETTLEMENT_GRACE_SECS);
+            for cid in due {
+                // Skip conditions that were just settled normally
+                if resolutions_by_condition.contains_key(&cid) {
+                    continue;
+                }
+                if let Some(secs_past) = self.pnl_tracker.time_past_expiry(&cid) {
+                    if secs_past > FORCE_SETTLE_TIMEOUT_SECS {
+                        warn!(
+                            condition_id = %cid,
+                            seconds_past_expiry = secs_past,
+                            "force-settling stuck position as full loss after {}s timeout",
+                            FORCE_SETTLE_TIMEOUT_SECS,
+                        );
+                        if let Some(rec) = self.pnl_tracker.force_settle(&cid) {
+                            self.resolution_poll_not_before.remove(&cid);
+                            self.remove_dashboard_pending(&cid, "force_settled");
+                            force_settled.push(rec);
+                        }
+                    }
+                }
+            }
+        }
+
+        if settled.is_empty() && force_settled.is_empty() {
             return;
         }
 
         let mode_label = if self.paper_mode { "paper" } else { "live" };
-        for rec in &settled {
+        let all_settled: Vec<_> = settled.iter().chain(force_settled.iter()).collect();
+        for rec in &all_settled {
             if let Some(cal) = self.calibration_by_asset.get_mut(&rec.asset) {
                 cal.record(
                     rec.model_yes_prob,
@@ -1815,9 +1878,14 @@ impl TradingLoop {
                     );
                 }
             }
+            let event_name = if rec.settlement_source == "force_settle_timeout" {
+                "force_settled"
+            } else {
+                "position_settled"
+            };
             let trade_payload = closed_trade_payload(rec);
             self.event_logger
-                .try_log_value("position_settled", trade_payload.clone());
+                .try_log_value(event_name, trade_payload.clone());
             // Dashboard: closed event
             let mut closed_msg = trade_payload.clone();
             if let serde_json::Value::Object(ref mut m) = closed_msg {
@@ -1828,18 +1896,28 @@ impl TradingLoop {
             if let Some(ref mut ts) = self.trade_sheet {
                 ts.record_closed(rec);
             }
-            info!(
-                asset = %rec.asset,
-                token_id = %rec.token_id,
-                realized = %rec.realized_pnl,
-                actual_yes = rec.actual_yes_outcome,
-                mode = mode_label,
-                "position settled"
-            );
+            if rec.settlement_source == "force_settle_timeout" {
+                warn!(
+                    asset = %rec.asset,
+                    token_id = %rec.token_id,
+                    realized = %rec.realized_pnl,
+                    mode = mode_label,
+                    "position force-settled as loss (stuck past timeout)"
+                );
+            } else {
+                info!(
+                    asset = %rec.asset,
+                    token_id = %rec.token_id,
+                    realized = %rec.realized_pnl,
+                    actual_yes = rec.actual_yes_outcome,
+                    mode = mode_label,
+                    "position settled"
+                );
+            }
         }
 
         // Prune reference cache for settled markets
-        let settled_keys: Vec<_> = settled
+        let settled_keys: Vec<_> = all_settled
             .iter()
             .filter_map(|s| {
                 let asset = s.asset;
@@ -1850,7 +1928,8 @@ impl TradingLoop {
 
         if self.dashboard_enabled {
             let snapshot = self.pnl_tracker.snapshot();
-            print_pnl_dashboard(&snapshot, mode_label, "settlement", Some(&settled));
+            let all_owned: Vec<_> = settled.iter().chain(force_settled.iter()).cloned().collect();
+            print_pnl_dashboard(&snapshot, mode_label, "settlement", Some(&all_owned));
             let snap_payload = pnl_snapshot_payload(&snapshot, "settlement");
             self.push_dashboard_snap(
                 &snap_payload,

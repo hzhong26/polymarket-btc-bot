@@ -436,6 +436,84 @@ impl PnlTracker {
         closed
     }
 
+    /// Returns the number of seconds a position has been past its end_time,
+    /// or None if the position doesn't exist or has no end_time.
+    pub fn time_past_expiry(&self, condition_id: &str) -> Option<i64> {
+        let cond = normalize_condition_id(condition_id)?;
+        let now = Utc::now();
+        self.positions.values().find_map(|pos| {
+            let pos_cond = pos.condition_id.as_deref().and_then(normalize_condition_id)?;
+            if pos_cond == cond {
+                let end_time = pos.end_time?;
+                let diff = (now - end_time).num_seconds();
+                if diff > 0 { Some(diff) } else { None }
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Force-settle a stuck position as a full loss. Removes the position from
+    /// tracking and returns a ClosedTradeRecord with pnl = -stake.
+    pub fn force_settle(&mut self, condition_id: &str) -> Option<ClosedTradeRecord> {
+        let cond = normalize_condition_id(condition_id)?;
+        let now = Utc::now();
+
+        // Find the token_id for this condition
+        let token_id = self.positions.iter().find_map(|(tid, pos)| {
+            let pos_cond = pos.condition_id.as_deref().and_then(normalize_condition_id)?;
+            if pos_cond == cond && pos.quantity > Decimal::ZERO {
+                Some(tid.clone())
+            } else {
+                None
+            }
+        })?;
+
+        let position = self.positions.remove(&token_id)?;
+        self.settled_condition_ids.insert(cond);
+
+        // Full loss: payout = 0
+        let realized = -position.avg_entry_price * position.quantity;
+        self.realized_pnl += realized;
+        *self
+            .realized_by_asset
+            .entry(position.asset)
+            .or_insert(Decimal::ZERO) += realized;
+
+        self.closed_trades += 1;
+        self.losses += 1;
+
+        // Determine actual_yes_outcome based on assuming loss
+        let actual_yes_outcome = match position.outcome_side {
+            OutcomeTokenSide::Yes => false,
+            OutcomeTokenSide::No => true,
+        };
+
+        Some(ClosedTradeRecord {
+            opened_at: position.opened_at,
+            closed_at: now,
+            end_time: position.end_time,
+            window_start: position.window_start,
+            asset: position.asset,
+            token_id: position.token_id,
+            condition_id: position.condition_id,
+            market_question: position.market_question,
+            outcome_side: position.outcome_side,
+            avg_entry_price: position.avg_entry_price,
+            quantity: position.quantity,
+            predicted_yes_prob: position.predicted_yes_prob_avg,
+            model_yes_prob: position.model_yes_prob_avg,
+            actual_yes_outcome,
+            payout_price: Decimal::ZERO,
+            realized_pnl: realized,
+            model_type: position.model_type,
+            official_price_to_beat: position.official_price_to_beat,
+            official_final_price: None,
+            settlement_source: "force_settle_timeout".to_string(),
+            resolution_available_at: Some(now),
+        })
+    }
+
     pub fn snapshot(&self) -> PnlSnapshot {
         let mut by_asset: HashMap<PriceAsset, AssetAccumulator> = PriceAsset::ALL
             .into_iter()
