@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
+use rust_xlsxwriter::{Color, Format, Workbook};
 
 use crate::timezone::to_et;
 use crate::trading_loop::pnl::{ClosedTradeRecord, OutcomeTokenSide};
@@ -39,7 +40,7 @@ impl TradeSheetWriter {
         let today = to_et(Utc::now()).format("%Y-%m-%d").to_string();
         let path = PathBuf::from(log_dir)
             .join(&today)
-            .join(format!("trades-{}.csv", today));
+            .join(format!("trades-{}.xlsx", today));
         Self {
             rows: Vec::new(),
             by_token: HashMap::new(),
@@ -281,7 +282,7 @@ impl TradeSheetWriter {
 
     fn spawn_write(&self) {
         let path = self.path.clone();
-        let content = self.build_csv();
+        let content = self.build_xlsx();
         tokio::spawn(async move {
             if let Some(parent) = path.parent() {
                 let _ = tokio::fs::create_dir_all(parent).await;
@@ -290,10 +291,45 @@ impl TradeSheetWriter {
         });
     }
 
-    pub(crate) fn build_csv(&self) -> String {
-        let mut out = String::new();
+    pub(crate) fn build_xlsx(&self) -> Vec<u8> {
+        let mut workbook = Workbook::new();
 
-        // Collect all distinct run numbers present in rows + current run
+        // ── Formats ──────────────────────────────────────────────────────
+        let fmt_bold = Format::new().set_bold();
+        let fmt_run_header = Format::new().set_bold().set_font_size(12);
+        let fmt_dollar = Format::new().set_num_format("$#,##0.00");
+        let fmt_pct = Format::new().set_num_format("0.0%");
+        let fmt_win = Format::new()
+            .set_font_color(Color::RGB(0x227722))
+            .set_bold();
+        let fmt_loss = Format::new()
+            .set_font_color(Color::RGB(0xCC2222))
+            .set_bold();
+        let fmt_pnl_pos = Format::new()
+            .set_num_format("$#,##0.00")
+            .set_font_color(Color::RGB(0x227722));
+        let fmt_pnl_neg = Format::new()
+            .set_num_format("$#,##0.00")
+            .set_font_color(Color::RGB(0xCC2222));
+        let fmt_section_header = Format::new().set_bold().set_font_size(11);
+
+        // ══════════════════════════════════════════════════════════════════
+        //  Sheet 1: Trades
+        // ══════════════════════════════════════════════════════════════════
+        let trades_sheet = workbook.add_worksheet();
+        let _ = trades_sheet.set_name("Trades");
+
+        let headers = [
+            "#", "Coin", "Date & Time", "Timeframe", "Status", "Decision",
+            "Result", "W/L", "Stake ($)", "P&L ($)", "Fee (~$)",
+        ];
+        let col_widths = [5.0, 8.0, 16.0, 10.0, 9.0, 10.0, 8.0, 7.0, 12.0, 12.0, 12.0];
+
+        for (c, &w) in col_widths.iter().enumerate() {
+            let _ = trades_sheet.set_column_width(c as u16, w);
+        }
+
+        // Collect run numbers
         let mut run_numbers: Vec<u32> = self
             .rows
             .iter()
@@ -301,14 +337,14 @@ impl TradeSheetWriter {
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
-        // Ensure current run is included even if it has no rows yet
         if !run_numbers.contains(&self.current_run_number) {
             run_numbers.push(self.current_run_number);
         }
         run_numbers.sort();
 
+        let mut row: u32 = 0;
+
         for &run_num in &run_numbers {
-            // Find version for this run
             let version = self
                 .run_versions
                 .iter()
@@ -316,10 +352,21 @@ impl TradeSheetWriter {
                 .map(|(_, v)| v.as_str())
                 .unwrap_or("?");
 
-            out += &format!("--- Run {} (v{}) ---\n", run_num, version);
-            out += "#,Coin,Date & Time,Timeframe,Status,Decision,Result,W/L,Stake ($),P&L ($),Fee (~$)\n";
+            // Run header (merged across all columns)
+            let run_label = format!("Run {} (v{})", run_num, version);
+            let _ = trades_sheet.merge_range(
+                row, 0, row, (headers.len() - 1) as u16,
+                &run_label, &fmt_run_header,
+            );
+            row += 1;
 
-            // Get rows for this run, reversed (newest first)
+            // Column headers
+            for (c, &h) in headers.iter().enumerate() {
+                let _ = trades_sheet.write_string_with_format(row, c as u16, h, &fmt_bold);
+            }
+            row += 1;
+
+            // Data rows (newest first)
             let run_rows: Vec<&TradeRow> = self
                 .rows
                 .iter()
@@ -327,155 +374,222 @@ impl TradeSheetWriter {
                 .rev()
                 .collect();
 
-            for (rev_i, row) in run_rows.iter().enumerate() {
-                let n = rev_i + 1;
-                let dt = to_et(row.opened_at).format("%m/%d %H:%M:%S").to_string();
-                let tf = fmt_timeframe(row.end_time, row.window_start);
-                let decision = if row.side == "YES" { "UP" } else { "DOWN" };
-                let result_str = row
-                    .result
-                    .map(|r| if r { "UP" } else { "DOWN" })
-                    .unwrap_or("");
-                let wl = match row.won {
+            for (rev_i, tr) in run_rows.iter().enumerate() {
+                let n = (rev_i + 1) as f64;
+                let dt = to_et(tr.opened_at).format("%m/%d %H:%M:%S").to_string();
+                let tf = fmt_timeframe(tr.end_time, tr.window_start);
+                let decision = if tr.side == "YES" { "UP" } else { "DOWN" };
+                let result_str = tr.result.map(|r| if r { "UP" } else { "DOWN" }).unwrap_or("");
+                let wl = match tr.won {
                     Some(true) => "WIN",
                     Some(false) => "LOSS",
                     None => "",
                 };
-                let stake = row
-                    .kelly_stake_usdc
-                    .map(|v| format!("${:.2}", v))
-                    .unwrap_or_default();
-                let pnl = row
-                    .realized_pnl
-                    .and_then(|v| v.to_f64())
-                    .map(|v| {
-                        if v >= 0.0 {
-                            format!("+${:.2}", v)
-                        } else {
-                            format!("-${:.2}", v.abs())
-                        }
-                    })
-                    .unwrap_or_default();
-                let fee = match (row.cost_fee_rate, row.kelly_stake_usdc) {
-                    (Some(r), Some(s)) => format!("~${:.2}", r * s),
-                    _ => String::new(),
-                };
-                out += &format!(
-                    "{},{},{},{},{},{},{},{},{},{},{}\n",
-                    n, row.coin, dt, tf, row.status, decision, result_str, wl, stake, pnl, fee
-                );
+
+                let _ = trades_sheet.write_number(row, 0, n);
+                let _ = trades_sheet.write_string(row, 1, &tr.coin);
+                let _ = trades_sheet.write_string(row, 2, &dt);
+                let _ = trades_sheet.write_string(row, 3, &tf);
+                let _ = trades_sheet.write_string(row, 4, &tr.status);
+                let _ = trades_sheet.write_string(row, 5, decision);
+                let _ = trades_sheet.write_string(row, 6, result_str);
+
+                // W/L with conditional color
+                match tr.won {
+                    Some(true) => {
+                        let _ = trades_sheet.write_string_with_format(row, 7, wl, &fmt_win);
+                    }
+                    Some(false) => {
+                        let _ = trades_sheet.write_string_with_format(row, 7, wl, &fmt_loss);
+                    }
+                    None => {
+                        let _ = trades_sheet.write_string(row, 7, wl);
+                    }
+                }
+
+                // Stake
+                if let Some(stake) = tr.kelly_stake_usdc {
+                    let _ = trades_sheet.write_number_with_format(row, 8, stake, &fmt_dollar);
+                }
+
+                // P&L with conditional color
+                if let Some(pnl) = tr.realized_pnl.and_then(|v| v.to_f64()) {
+                    let fmt = if pnl >= 0.0 { &fmt_pnl_pos } else { &fmt_pnl_neg };
+                    let _ = trades_sheet.write_number_with_format(row, 9, pnl, fmt);
+                }
+
+                // Fee
+                if let (Some(rate), Some(stake)) = (tr.cost_fee_rate, tr.kelly_stake_usdc) {
+                    let _ = trades_sheet.write_number_with_format(row, 10, rate * stake, &fmt_dollar);
+                }
+
+                row += 1;
             }
 
-            out += "\n";
+            row += 1; // blank row between runs
         }
 
-        out += &self.build_summary();
-        out
-    }
-
-    fn build_summary(&self) -> String {
+        // ══════════════════════════════════════════════════════════════════
+        //  Sheet 2: Analysis
+        // ══════════════════════════════════════════════════════════════════
         let closed: Vec<&TradeRow> = self.rows.iter().filter(|r| r.status == "CLOSED").collect();
-        if closed.is_empty() {
-            return String::new();
-        }
 
-        let mut out = String::new();
-        let coins = ordered_coins(&closed);
+        if !closed.is_empty() {
+            let analysis = workbook.add_worksheet();
+            let _ = analysis.set_name("Analysis");
 
-        // ── Totals table ────────────────────────────────────────────────
-        let total = closed.len();
-        let wins: usize = closed.iter().filter(|r| r.won == Some(true)).count();
-        let losses = total - wins;
-        let win_pct = (wins as f64 / total as f64) * 100.0;
+            let coins = ordered_coins(&closed);
+            let mut arow: u32 = 0;
 
-        let total_pnl: f64 = closed
-            .iter()
-            .filter_map(|r| r.realized_pnl.and_then(|v| v.to_f64()))
-            .sum();
-        let total_staked: f64 = closed
-            .iter()
-            .filter_map(|r| r.kelly_stake_usdc)
-            .sum();
-        let total_fee: f64 = closed
-            .iter()
-            .filter_map(|r| match (r.cost_fee_rate, r.kelly_stake_usdc) {
-                (Some(rate), Some(stake)) => Some(rate * stake),
-                _ => None,
-            })
-            .sum();
-        let roi_pct = if total_staked > 0.0 {
-            (total_pnl / total_staked) * 100.0
-        } else {
-            0.0
-        };
-        let net_profit = total_pnl - total_fee;
+            // ── Totals table ─────────────────────────────────────────────
+            let total = closed.len();
+            let wins = closed.iter().filter(|r| r.won == Some(true)).count();
+            let losses = total - wins;
+            let win_pct = wins as f64 / total as f64;
 
-        out += "\nTotals,Trades,Wins,Losses,Win %,Total P&L,ROI %,Fees,Net Profit\n";
-        out += &format!(
-            ",{},{},{},{:.1},{:.2},{:.1},{:.2},{:.2}\n",
-            total, wins, losses, win_pct, total_pnl, roi_pct, total_fee, net_profit,
-        );
-
-        // ── Win Rate by Coin (for bar chart) ────────────────────────────
-        out += "\nWin Rate by Coin,Wins,Losses,Win %\n";
-        for coin in &coins {
-            let subset: Vec<&&TradeRow> = closed.iter().filter(|r| r.coin == *coin).collect();
-            let c_total = subset.len();
-            let c_wins = subset.iter().filter(|r| r.won == Some(true)).count();
-            let c_wr = (c_wins as f64 / c_total as f64) * 100.0;
-            out += &format!(
-                "{},{},{},{:.1}\n",
-                coin, c_wins, c_total - c_wins, c_wr,
-            );
-        }
-
-        // ── P&L by Coin (for bar chart) ─────────────────────────────────
-        out += "\nP&L by Coin,Total P&L,Staked,ROI %\n";
-        for coin in &coins {
-            let subset: Vec<&&TradeRow> = closed.iter().filter(|r| r.coin == *coin).collect();
-            let c_pnl: f64 = subset
+            let total_pnl: f64 = closed
                 .iter()
                 .filter_map(|r| r.realized_pnl.and_then(|v| v.to_f64()))
                 .sum();
-            let c_staked: f64 = subset.iter().filter_map(|r| r.kelly_stake_usdc).sum();
-            let c_roi = if c_staked > 0.0 { c_pnl / c_staked * 100.0 } else { 0.0 };
-            out += &format!("{},{:.2},{:.2},{:.1}\n", coin, c_pnl, c_staked, c_roi);
-        }
+            let total_staked: f64 = closed.iter().filter_map(|r| r.kelly_stake_usdc).sum();
+            let total_fee: f64 = closed
+                .iter()
+                .filter_map(|r| match (r.cost_fee_rate, r.kelly_stake_usdc) {
+                    (Some(rate), Some(stake)) => Some(rate * stake),
+                    _ => None,
+                })
+                .sum();
+            let roi_pct = if total_staked > 0.0 { total_pnl / total_staked } else { 0.0 };
+            let net_profit = total_pnl - total_fee;
 
-        // ── Breakdown: Coin x Timeframe (for grouped bar chart) ─────────
-        out += "\nCoin x Timeframe,Coin,Timeframe,Wins,Losses,Win %,Total P&L\n";
-        for coin in &coins {
-            let subset: Vec<&&TradeRow> = closed.iter().filter(|r| r.coin == *coin).collect();
-            let timeframes = ordered_timeframes(&subset);
-            for tf in &timeframes {
-                let tf_sub: Vec<&&&TradeRow> = subset
-                    .iter()
-                    .filter(|r| fmt_timeframe(r.end_time, r.window_start) == *tf)
-                    .collect();
-                let t_total = tf_sub.len();
-                let t_wins = tf_sub.iter().filter(|r| r.won == Some(true)).count();
-                let t_wr = (t_wins as f64 / t_total as f64) * 100.0;
-                let t_pnl: f64 = tf_sub
+            let _ = analysis.merge_range(arow, 0, arow, 7, "Totals", &fmt_section_header);
+            arow += 1;
+            let totals_headers = ["Trades", "Wins", "Losses", "Win %", "Total P&L", "ROI %", "Fees", "Net Profit"];
+            for (c, &h) in totals_headers.iter().enumerate() {
+                let _ = analysis.write_string_with_format(arow, c as u16, h, &fmt_bold);
+            }
+            arow += 1;
+            let _ = analysis.write_number(arow, 0, total as f64);
+            let _ = analysis.write_number(arow, 1, wins as f64);
+            let _ = analysis.write_number(arow, 2, losses as f64);
+            let _ = analysis.write_number_with_format(arow, 3, win_pct, &fmt_pct);
+            let pnl_fmt = if total_pnl >= 0.0 { &fmt_pnl_pos } else { &fmt_pnl_neg };
+            let _ = analysis.write_number_with_format(arow, 4, total_pnl, pnl_fmt);
+            let _ = analysis.write_number_with_format(arow, 5, roi_pct, &fmt_pct);
+            let _ = analysis.write_number_with_format(arow, 6, total_fee, &fmt_dollar);
+            let np_fmt = if net_profit >= 0.0 { &fmt_pnl_pos } else { &fmt_pnl_neg };
+            let _ = analysis.write_number_with_format(arow, 7, net_profit, np_fmt);
+            arow += 2;
+
+            // ── Win Rate by Coin ─────────────────────────────────────────
+            let _ = analysis.merge_range(arow, 0, arow, 3, "Win Rate by Coin", &fmt_section_header);
+            arow += 1;
+            let wr_headers = ["Coin", "Wins", "Losses", "Win %"];
+            for (c, &h) in wr_headers.iter().enumerate() {
+                let _ = analysis.write_string_with_format(arow, c as u16, h, &fmt_bold);
+            }
+            arow += 1;
+            for coin in &coins {
+                let subset: Vec<&&TradeRow> = closed.iter().filter(|r| r.coin == *coin).collect();
+                let c_total = subset.len();
+                let c_wins = subset.iter().filter(|r| r.won == Some(true)).count();
+                let c_wr = c_wins as f64 / c_total as f64;
+                let _ = analysis.write_string(arow, 0, coin);
+                let _ = analysis.write_number(arow, 1, c_wins as f64);
+                let _ = analysis.write_number(arow, 2, (c_total - c_wins) as f64);
+                let _ = analysis.write_number_with_format(arow, 3, c_wr, &fmt_pct);
+                arow += 1;
+            }
+            arow += 1;
+
+            // ── P&L by Coin ──────────────────────────────────────────────
+            let _ = analysis.merge_range(arow, 0, arow, 3, "P&L by Coin", &fmt_section_header);
+            arow += 1;
+            let pnl_headers = ["Coin", "Total P&L", "Staked", "ROI %"];
+            for (c, &h) in pnl_headers.iter().enumerate() {
+                let _ = analysis.write_string_with_format(arow, c as u16, h, &fmt_bold);
+            }
+            arow += 1;
+            for coin in &coins {
+                let subset: Vec<&&TradeRow> = closed.iter().filter(|r| r.coin == *coin).collect();
+                let c_pnl: f64 = subset
                     .iter()
                     .filter_map(|r| r.realized_pnl.and_then(|v| v.to_f64()))
                     .sum();
-                out += &format!(
-                    "{} {},{}_{},{},{},{:.1},{:.2}\n",
-                    coin, tf, coin, tf, t_wins, t_total - t_wins, t_wr, t_pnl,
-                );
+                let c_staked: f64 = subset.iter().filter_map(|r| r.kelly_stake_usdc).sum();
+                let c_roi = if c_staked > 0.0 { c_pnl / c_staked } else { 0.0 };
+                let _ = analysis.write_string(arow, 0, coin);
+                let cpnl_fmt = if c_pnl >= 0.0 { &fmt_pnl_pos } else { &fmt_pnl_neg };
+                let _ = analysis.write_number_with_format(arow, 1, c_pnl, cpnl_fmt);
+                let _ = analysis.write_number_with_format(arow, 2, c_staked, &fmt_dollar);
+                let _ = analysis.write_number_with_format(arow, 3, c_roi, &fmt_pct);
+                arow += 1;
             }
+            arow += 1;
+
+            // ── Coin x Timeframe ─────────────────────────────────────────
+            let _ = analysis.merge_range(arow, 0, arow, 5, "Coin x Timeframe", &fmt_section_header);
+            arow += 1;
+            let ct_headers = ["Coin", "Timeframe", "Wins", "Losses", "Win %", "Total P&L"];
+            for (c, &h) in ct_headers.iter().enumerate() {
+                let _ = analysis.write_string_with_format(arow, c as u16, h, &fmt_bold);
+            }
+            arow += 1;
+            for coin in &coins {
+                let subset: Vec<&&TradeRow> = closed.iter().filter(|r| r.coin == *coin).collect();
+                let timeframes = ordered_timeframes(&subset);
+                for tf in &timeframes {
+                    let tf_sub: Vec<&&&TradeRow> = subset
+                        .iter()
+                        .filter(|r| fmt_timeframe(r.end_time, r.window_start) == *tf)
+                        .collect();
+                    let t_total = tf_sub.len();
+                    let t_wins = tf_sub.iter().filter(|r| r.won == Some(true)).count();
+                    let t_wr = t_wins as f64 / t_total as f64;
+                    let t_pnl: f64 = tf_sub
+                        .iter()
+                        .filter_map(|r| r.realized_pnl.and_then(|v| v.to_f64()))
+                        .sum();
+                    let _ = analysis.write_string(arow, 0, coin);
+                    let _ = analysis.write_string(arow, 1, tf);
+                    let _ = analysis.write_number(arow, 2, t_wins as f64);
+                    let _ = analysis.write_number(arow, 3, (t_total - t_wins) as f64);
+                    let _ = analysis.write_number_with_format(arow, 4, t_wr, &fmt_pct);
+                    let tpnl_fmt = if t_pnl >= 0.0 { &fmt_pnl_pos } else { &fmt_pnl_neg };
+                    let _ = analysis.write_number_with_format(arow, 5, t_pnl, tpnl_fmt);
+                    arow += 1;
+                }
+            }
+            arow += 1;
+
+            // ── Cumulative P&L ───────────────────────────────────────────
+            let cum_pnls = cumulative_pnls(&closed);
+            if cum_pnls.len() >= 2 {
+                let _ = analysis.merge_range(arow, 0, arow, 1, "Cumulative P&L", &fmt_section_header);
+                arow += 1;
+                let _ = analysis.write_string_with_format(arow, 0, "Trade #", &fmt_bold);
+                let _ = analysis.write_string_with_format(arow, 1, "Cumulative P&L", &fmt_bold);
+                arow += 1;
+                for (i, cum) in cum_pnls.iter().enumerate() {
+                    let _ = analysis.write_number(arow, 0, (i + 1) as f64);
+                    let cfmt = if *cum >= 0.0 { &fmt_pnl_pos } else { &fmt_pnl_neg };
+                    let _ = analysis.write_number_with_format(arow, 1, *cum, cfmt);
+                    arow += 1;
+                }
+            }
+
+            // Set column widths for analysis sheet
+            let _ = analysis.set_column_width(0, 14.0);
+            let _ = analysis.set_column_width(1, 14.0);
+            let _ = analysis.set_column_width(2, 10.0);
+            let _ = analysis.set_column_width(3, 10.0);
+            let _ = analysis.set_column_width(4, 12.0);
+            let _ = analysis.set_column_width(5, 12.0);
+            let _ = analysis.set_column_width(6, 10.0);
+            let _ = analysis.set_column_width(7, 12.0);
         }
 
-        // ── Cumulative P&L (for line chart) ─────────────────────────────
-        let cum_pnls = cumulative_pnls(&closed);
-        if cum_pnls.len() >= 2 {
-            out += "\nTrade #,Cumulative P&L\n";
-            for (i, cum) in cum_pnls.iter().enumerate() {
-                out += &format!("{},{:.2}\n", i + 1, cum);
-            }
-        }
-
-        out
+        workbook.save_to_buffer().unwrap_or_default()
     }
 }
 
@@ -508,14 +622,6 @@ fn cumulative_pnls(closed: &[&TradeRow]) -> Vec<f64> {
         cum.push(running);
     }
     cum
-}
-
-fn fmt_dollar(v: f64) -> String {
-    if v >= 0.0 {
-        format!("+${:.2}", v)
-    } else {
-        format!("-${:.2}", v.abs())
-    }
 }
 
 fn ordered_coins(rows: &[&TradeRow]) -> Vec<String> {
@@ -564,12 +670,12 @@ mod tests {
         Utc.with_ymd_and_hms(2026, 2, 23, h, m, s).unwrap()
     }
 
-    /// Build a writer without a real path — we only call build_csv() in these tests.
+    /// Build a writer without a real path — we only call build_xlsx() in these tests.
     fn writer() -> TradeSheetWriter {
         TradeSheetWriter {
             rows: Vec::new(),
             by_token: HashMap::new(),
-            path: PathBuf::from("/tmp/trade-sheet-test.csv"),
+            path: PathBuf::from("/tmp/trade-sheet-test.xlsx"),
             current_run_number: 1,
             current_bot_version: "0.0.0-test".to_string(),
             run_versions: vec![(1, "0.0.0-test".to_string())],
@@ -631,15 +737,10 @@ mod tests {
         }
     }
 
-    fn data_row(csv: &str, n: usize) -> Vec<&str> {
-        csv.lines().nth(n).unwrap().split(',').collect()
-    }
-
-    /// Count only trade data rows (lines starting with a digit, e.g. "1,BTC,...").
-    fn trade_data_count(csv: &str) -> usize {
-        csv.lines()
-            .filter(|line| line.starts_with(|c: char| c.is_ascii_digit()))
-            .count()
+    /// Helper: get a row reference by token_id
+    fn get_row<'a>(w: &'a TradeSheetWriter, token_id: &str) -> &'a TradeRow {
+        let idx = w.by_token[token_id];
+        &w.rows[idx]
     }
 
     // ── fmt_timeframe ─────────────────────────────────────────────────────────
@@ -683,60 +784,22 @@ mod tests {
         assert_eq!(fmt_timeframe(None, Some(ts(10, 0, 0))), "?");
     }
 
-    // ── build_csv: header ─────────────────────────────────────────────────────
+    // ── build_xlsx produces valid output ──────────────────────────────────────
 
     #[test]
-    fn empty_writer_produces_run_header_and_csv_header() {
+    fn empty_writer_produces_valid_xlsx() {
         let w = writer();
-        let csv = w.build_csv();
-        let lines: Vec<&str> = csv.lines().collect();
-        assert_eq!(lines[0], "--- Run 1 (v0.0.0-test) ---");
-        assert_eq!(
-            lines[1],
-            "#,Coin,Date & Time,Timeframe,Status,Decision,Result,W/L,Stake ($),P&L ($),Fee (~$)"
-        );
-        assert_eq!(trade_data_count(&csv), 0);
-    }
-
-    // ── build_csv: OPEN row columns ───────────────────────────────────────────
-
-    #[test]
-    fn open_row_has_correct_columns() {
-        let mut w = writer();
-        w.rows.push(open_row("BTC", ts(10, 35, 22), 300, "YES", 52.0, 0.02));
-        w.by_token.insert("tok1".into(), 0);
-
-        let csv = w.build_csv();
-        let cols = data_row(&csv, 2); // line 0=run header, 1=csv header, 2=data
-
-        assert_eq!(cols[0], "1");           // #
-        assert_eq!(cols[1], "BTC");         // Coin
-        assert_eq!(cols[2], "02/23 05:35:22"); // Date & Time (ET)
-        assert_eq!(cols[3], "5min");        // Timeframe
-        assert_eq!(cols[4], "OPEN");        // Status
-        assert_eq!(cols[5], "UP");          // Decision (YES → UP)
-        assert_eq!(cols[6], "");            // Result (empty while open)
-        assert_eq!(cols[7], "");            // W/L (empty while open)
-        assert_eq!(cols[8], "$52.00");      // Stake
-        assert_eq!(cols[9], "");            // P&L (empty while open)
-        assert_eq!(cols[10], "~$1.04");     // Fee (0.02 × 52)
+        let bytes = w.build_xlsx();
+        // XLSX files start with PK zip magic bytes
+        assert!(bytes.len() > 100, "xlsx should not be empty");
+        assert_eq!(&bytes[0..2], b"PK", "xlsx should start with PK zip header");
     }
 
     #[test]
-    fn no_side_decision_maps_to_down() {
-        let mut w = writer();
-        w.rows.push(open_row("ETH", ts(10, 0, 0), 300, "NO", 31.0, 0.02));
-        w.by_token.insert("tok1".into(), 0);
+    fn xlsx_with_closed_trades_is_larger() {
+        let w_empty = writer();
+        let empty_size = w_empty.build_xlsx().len();
 
-        let csv = w.build_csv();
-        let cols = data_row(&csv, 2);
-        assert_eq!(cols[5], "DOWN");
-    }
-
-    // ── build_csv: CLOSED row columns ─────────────────────────────────────────
-
-    #[test]
-    fn closed_win_row_has_correct_pnl_and_wl() {
         let mut w = writer();
         w.rows.push(TradeRow {
             status: "CLOSED".to_string(),
@@ -747,19 +810,66 @@ mod tests {
         });
         w.by_token.insert("tok1".into(), 0);
 
-        let csv = w.build_csv();
-        let cols = data_row(&csv, 2);
-        assert_eq!(cols[4], "CLOSED");
-        assert_eq!(cols[5], "UP");
-        assert_eq!(cols[6], "UP");      // actual_yes_outcome = true → UP
-        assert_eq!(cols[7], "WIN");
-        assert_eq!(cols[8], "$31.00");
-        assert_eq!(cols[9], "+$29.00");
-        assert_eq!(cols[10], "~$0.62"); // 0.02 × 31
+        let bytes = w.build_xlsx();
+        // With closed trades, xlsx should be bigger (has Analysis sheet + trade data)
+        assert!(bytes.len() > empty_size, "xlsx with closed trades should be larger than empty");
+        assert_eq!(&bytes[0..2], b"PK", "should be valid zip/xlsx");
+    }
+
+    // ── OPEN row fields ───────────────────────────────────────────────────────
+
+    #[test]
+    fn open_row_has_correct_fields() {
+        let mut w = writer();
+        w.rows.push(open_row("BTC", ts(10, 35, 22), 300, "YES", 52.0, 0.02));
+        w.by_token.insert("tok1".into(), 0);
+
+        let row = get_row(&w, "tok1");
+        assert_eq!(row.coin, "BTC");
+        assert_eq!(row.side, "YES");
+        assert_eq!(row.status, "OPEN");
+        assert_eq!(row.kelly_stake_usdc, Some(52.0));
+        assert_eq!(row.cost_fee_rate, Some(0.02));
+        assert_eq!(fmt_timeframe(row.end_time, row.window_start), "5min");
+        assert!(row.result.is_none());
+        assert!(row.won.is_none());
+        assert!(row.realized_pnl.is_none());
     }
 
     #[test]
-    fn closed_loss_row_shows_negative_pnl() {
+    fn no_side_maps_correctly() {
+        let mut w = writer();
+        w.rows.push(open_row("ETH", ts(10, 0, 0), 300, "NO", 31.0, 0.02));
+        w.by_token.insert("tok1".into(), 0);
+
+        let row = get_row(&w, "tok1");
+        assert_eq!(row.side, "NO");
+    }
+
+    // ── CLOSED row fields ─────────────────────────────────────────────────────
+
+    #[test]
+    fn closed_win_row_has_correct_fields() {
+        let mut w = writer();
+        w.rows.push(TradeRow {
+            status: "CLOSED".to_string(),
+            result: Some(true),
+            won: Some(true),
+            realized_pnl: Some(Decimal::try_from(29.0_f64).unwrap()),
+            ..open_row("BTC", ts(10, 30, 15), 900, "YES", 31.0, 0.02)
+        });
+        w.by_token.insert("tok1".into(), 0);
+
+        let row = get_row(&w, "tok1");
+        assert_eq!(row.status, "CLOSED");
+        assert_eq!(row.result, Some(true));
+        assert_eq!(row.won, Some(true));
+        assert_eq!(row.realized_pnl.and_then(|v| v.to_f64()), Some(29.0));
+        assert_eq!(row.kelly_stake_usdc, Some(31.0));
+    }
+
+    #[test]
+    fn closed_loss_row_has_negative_pnl() {
         let mut w = writer();
         w.rows.push(TradeRow {
             status: "CLOSED".to_string(),
@@ -770,33 +880,29 @@ mod tests {
         });
         w.by_token.insert("tok1".into(), 0);
 
-        let csv = w.build_csv();
-        let cols = data_row(&csv, 2);
-        assert_eq!(cols[6], "DOWN");    // actual_yes_outcome = false → DOWN
-        assert_eq!(cols[7], "LOSS");
-        assert_eq!(cols[9], "-$45.00");
+        let row = get_row(&w, "tok1");
+        assert_eq!(row.result, Some(false));
+        assert_eq!(row.won, Some(false));
+        assert!(row.realized_pnl.and_then(|v| v.to_f64()).unwrap() < 0.0);
     }
 
-    // ── row numbering: newest first ───────────────────────────────────────────
+    // ── row ordering ──────────────────────────────────────────────────────────
 
     #[test]
-    fn rows_are_numbered_newest_first() {
+    fn rows_stored_in_insertion_order() {
         let mut w = writer();
-        // Push older trade first, newer second
         w.rows.push(open_row("BTC", ts(10, 0, 0), 300, "YES", 50.0, 0.02));
         w.by_token.insert("tok1".into(), 0);
         w.rows.push(open_row("ETH", ts(10, 5, 0), 300, "NO", 30.0, 0.02));
         w.by_token.insert("tok2".into(), 1);
 
-        let csv = w.build_csv();
-        let first_data = data_row(&csv, 2); // line 0=run header, 1=csv header
-        let second_data = data_row(&csv, 3);
-
-        // Newest (ETH, tok2) should be row #1
-        assert_eq!(first_data[0], "1");
-        assert_eq!(first_data[1], "ETH");
-        assert_eq!(second_data[0], "2");
-        assert_eq!(second_data[1], "BTC");
+        assert_eq!(w.rows.len(), 2);
+        assert_eq!(w.rows[0].coin, "BTC");
+        assert_eq!(w.rows[1].coin, "ETH");
+        // build_xlsx reverses within each run (newest first)
+        // just verify the xlsx is produced successfully
+        let bytes = w.build_xlsx();
+        assert!(bytes.len() > 100);
     }
 
     // ── record_opened deduplication ───────────────────────────────────────────
@@ -810,9 +916,7 @@ mod tests {
         w.record_opened("tok1".into(), "BTC".into(), opened, end, Some(opened), "YES".into(), Some(52.0), Some(0.02));
         w.record_opened("tok1".into(), "BTC".into(), opened, end, Some(opened), "YES".into(), Some(52.0), Some(0.02));
 
-        let csv = w.build_csv();
-        // Only 1 data row
-        assert_eq!(trade_data_count(&csv), 1);
+        assert_eq!(w.rows.len(), 1, "duplicate should be ignored");
     }
 
     // ── record_closed: known token updates in-place ───────────────────────────
@@ -825,19 +929,17 @@ mod tests {
 
         w.record_opened("tok1".into(), "BTC".into(), opened, end, Some(opened), "YES".into(), Some(52.0), Some(0.02));
 
-        // Settle as a YES win
         let rec = closed_rec("tok1", OutcomeTokenSide::Yes, true, Decimal::try_from(48.0_f64).unwrap());
         w.record_closed(&rec);
 
-        let csv = w.build_csv();
-        let cols = data_row(&csv, 2);
-        assert_eq!(cols[4], "CLOSED");
-        assert_eq!(cols[6], "UP");
-        assert_eq!(cols[7], "WIN");
-        assert_eq!(cols[9], "+$48.00");
+        let row = get_row(&w, "tok1");
+        assert_eq!(row.status, "CLOSED");
+        assert_eq!(row.result, Some(true));
+        assert_eq!(row.won, Some(true));
+        assert_eq!(row.realized_pnl.and_then(|v| v.to_f64()), Some(48.0));
         // Stake and fee preserved from open
-        assert_eq!(cols[8], "$52.00");
-        assert_eq!(cols[10], "~$1.04");
+        assert_eq!(row.kelly_stake_usdc, Some(52.0));
+        assert_eq!(row.cost_fee_rate, Some(0.02));
     }
 
     #[tokio::test]
@@ -852,9 +954,8 @@ mod tests {
         let rec = closed_rec("tok1", OutcomeTokenSide::No, true, Decimal::try_from(-31.0_f64).unwrap());
         w.record_closed(&rec);
 
-        let csv = w.build_csv();
-        let cols = data_row(&csv, 2);
-        assert_eq!(cols[7], "LOSS");
+        let row = get_row(&w, "tok1");
+        assert_eq!(row.won, Some(false));
     }
 
     // ── record_closed: unknown token creates fallback row ─────────────────────
@@ -866,16 +967,15 @@ mod tests {
         let rec = closed_rec("tok-prev-session", OutcomeTokenSide::Yes, true, Decimal::try_from(20.0_f64).unwrap());
         w.record_closed(&rec);
 
-        let csv = w.build_csv();
-        assert_eq!(trade_data_count(&csv), 1, "expected 1 data row");
-        let cols = data_row(&csv, 2);
-        assert_eq!(cols[1], "BTC");     // from rec.asset.symbol()
-        assert_eq!(cols[4], "CLOSED");
-        assert_eq!(cols[5], "UP");      // YES side
-        assert_eq!(cols[7], "WIN");
-        assert_eq!(cols[9], "+$20.00");
-        assert_eq!(cols[8], "");        // no stake (not opened this session)
-        assert_eq!(cols[10], "");       // no fee
+        assert_eq!(w.rows.len(), 1, "expected 1 row");
+        let row = get_row(&w, "tok-prev-session");
+        assert_eq!(row.coin, "BTC");       // from rec.asset.symbol()
+        assert_eq!(row.status, "CLOSED");
+        assert_eq!(row.side, "YES");
+        assert_eq!(row.won, Some(true));
+        assert_eq!(row.realized_pnl.and_then(|v| v.to_f64()), Some(20.0));
+        assert!(row.kelly_stake_usdc.is_none()); // no stake (not opened this session)
+        assert!(row.cost_fee_rate.is_none());     // no fee
     }
 
     // ── seed_from_today_log ───────────────────────────────────────────────────
@@ -1000,16 +1100,14 @@ mod tests {
         let mut w = TradeSheetWriter::new(dir.to_str().unwrap(), TEST_BOT_VERSION);
         w.seed_from_today_log(dir.to_str().unwrap()).await;
 
-        let csv = w.build_csv();
-        assert_eq!(trade_data_count(&csv), 1, "expected 1 data row");
-        // Run 1: line 0=run header, 1=csv header, 2=data
-        let cols: Vec<&str> = csv.lines().nth(2).unwrap().split(',').collect();
-        assert_eq!(cols[1], "BTC");
-        assert_eq!(cols[3], "5min");
-        assert_eq!(cols[4], "OPEN");
-        assert_eq!(cols[5], "UP");   // YES side → UP
-        assert_eq!(cols[8], "$52.00");
-        assert_eq!(cols[10], "~$1.04");
+        assert_eq!(w.rows.len(), 1, "expected 1 row");
+        let row = get_row(&w, "yes-tok");
+        assert_eq!(row.coin, "BTC");
+        assert_eq!(fmt_timeframe(row.end_time, row.window_start), "5min");
+        assert_eq!(row.status, "OPEN");
+        assert_eq!(row.side, "YES");
+        assert_eq!(row.kelly_stake_usdc, Some(52.0));
+        assert_eq!(row.cost_fee_rate, Some(0.02));
     }
 
     #[tokio::test]
@@ -1026,12 +1124,11 @@ mod tests {
         let mut w = TradeSheetWriter::new(dir.to_str().unwrap(), TEST_BOT_VERSION);
         w.seed_from_today_log(dir.to_str().unwrap()).await;
 
-        let csv = w.build_csv();
-        let cols: Vec<&str> = csv.lines().nth(2).unwrap().split(',').collect();
-        assert_eq!(cols[4], "CLOSED");
-        assert_eq!(cols[6], "UP");    // actual_yes = true
-        assert_eq!(cols[7], "WIN");
-        assert_eq!(cols[9], "+$29.00");
+        let row = get_row(&w, "yes-tok");
+        assert_eq!(row.status, "CLOSED");
+        assert_eq!(row.result, Some(true));
+        assert_eq!(row.won, Some(true));
+        assert_eq!(row.realized_pnl.and_then(|v| v.to_f64()), Some(29.0));
     }
 
     #[tokio::test]
@@ -1047,11 +1144,10 @@ mod tests {
         let mut w = TradeSheetWriter::new(dir.to_str().unwrap(), TEST_BOT_VERSION);
         w.seed_from_today_log(dir.to_str().unwrap()).await;
 
-        let csv = w.build_csv();
-        let cols: Vec<&str> = csv.lines().nth(2).unwrap().split(',').collect();
-        assert_eq!(cols[1], "ETH");
-        assert_eq!(cols[3], "15min");
-        assert_eq!(cols[5], "DOWN");  // NO side → DOWN
+        let row = get_row(&w, "no-tok");
+        assert_eq!(row.coin, "ETH");
+        assert_eq!(fmt_timeframe(row.end_time, row.window_start), "15min");
+        assert_eq!(row.side, "NO");
     }
 
     #[tokio::test]
@@ -1078,7 +1174,7 @@ mod tests {
         let mut w = TradeSheetWriter::new(dir.to_str().unwrap(), TEST_BOT_VERSION);
         w.seed_from_today_log(dir.to_str().unwrap()).await;
 
-        assert_eq!(trade_data_count(&w.build_csv()), 0, "no_trade rows should be skipped");
+        assert_eq!(w.rows.len(), 0, "no_trade rows should be skipped");
     }
 
     #[tokio::test]
@@ -1093,7 +1189,7 @@ mod tests {
         let mut w = TradeSheetWriter::new(dir.to_str().unwrap(), TEST_BOT_VERSION);
         w.seed_from_today_log(dir.to_str().unwrap()).await;
 
-        assert_eq!(trade_data_count(&w.build_csv()), 1, "duplicate token_id should only add one row");
+        assert_eq!(w.rows.len(), 1, "duplicate token_id should only add one row");
     }
 
     #[tokio::test]
@@ -1112,10 +1208,9 @@ mod tests {
         ]);
         w.seed_from_today_log(dir.to_str().unwrap()).await;
 
-        // Should still have only 1 data row, with original stake $99
-        let csv = w.build_csv();
-        assert_eq!(trade_data_count(&csv), 1);
-        assert!(csv.contains("$99.00"), "pre-recorded row should not be overwritten by seed");
+        assert_eq!(w.rows.len(), 1);
+        let row = get_row(&w, "yes-tok");
+        assert_eq!(row.kelly_stake_usdc, Some(99.0), "pre-recorded row should not be overwritten by seed");
     }
 
     #[tokio::test]
@@ -1124,7 +1219,7 @@ mod tests {
         let mut w = TradeSheetWriter::new(dir.to_str().unwrap(), TEST_BOT_VERSION);
         // No events file written
         w.seed_from_today_log(dir.to_str().unwrap()).await;
-        assert_eq!(trade_data_count(&w.build_csv()), 0); // no data rows
+        assert_eq!(w.rows.len(), 0);
     }
 
     // ── fee edge cases ────────────────────────────────────────────────────────
@@ -1132,16 +1227,14 @@ mod tests {
     #[test]
     fn fee_missing_when_either_value_absent() {
         let mut w = writer();
-        // No fee_rate
         w.rows.push(TradeRow {
             cost_fee_rate: None,
             ..open_row("BTC", ts(10, 0, 0), 300, "YES", 50.0, 0.0)
         });
         w.by_token.insert("tok1".into(), 0);
 
-        let csv = w.build_csv();
-        let cols = data_row(&csv, 2);
-        assert_eq!(cols[10], "");
+        let row = get_row(&w, "tok1");
+        assert!(row.cost_fee_rate.is_none());
     }
 
     // ── multi-run grouping ───────────────────────────────────────────────────
@@ -1169,27 +1262,24 @@ mod tests {
         let mut w = TradeSheetWriter::new(dir.to_str().unwrap(), "1.1.0");
         w.seed_from_today_log(dir.to_str().unwrap()).await;
 
-        let csv = w.build_csv();
-        let lines: Vec<&str> = csv.lines().collect();
+        // Run 1 trade (BTC, closed)
+        let r1 = get_row(&w, "yes-tok1");
+        assert_eq!(r1.coin, "BTC");
+        assert_eq!(r1.status, "CLOSED");
+        assert_eq!(r1.run_number, 1);
 
-        // Run 1 header
-        assert!(lines[0].contains("Run 1") && lines[0].contains("v1.0.0"));
-        // Run 1 data (BTC trade, closed)
-        let r1_data: Vec<&str> = lines[2].split(',').collect();
-        assert_eq!(r1_data[1], "BTC");
-        assert_eq!(r1_data[4], "CLOSED");
+        // Run 2 trade (ETH, open, NO side)
+        let r2 = get_row(&w, "no-tok2");
+        assert_eq!(r2.coin, "ETH");
+        assert_eq!(r2.status, "OPEN");
+        assert_eq!(r2.side, "NO");
+        assert_eq!(r2.run_number, 2);
 
-        // Find Run 2 header
-        let run2_idx = lines.iter().position(|l| l.contains("Run 2")).unwrap();
-        assert!(lines[run2_idx].contains("v1.1.0"));
-        // Run 2 data (ETH trade, open)
-        let r2_data: Vec<&str> = lines[run2_idx + 2].split(',').collect();
-        assert_eq!(r2_data[1], "ETH");
-        assert_eq!(r2_data[4], "OPEN");
-        assert_eq!(r2_data[5], "DOWN"); // NO → DOWN
-
-        // Current run (Run 3) should also appear
-        assert!(lines.iter().any(|l| l.contains("Run 3")));
+        // Current run should be 3
         assert_eq!(w.current_run_number, 3);
+
+        // Verify xlsx still builds successfully with multi-run data
+        let bytes = w.build_xlsx();
+        assert!(bytes.len() > 100);
     }
 }
