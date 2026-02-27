@@ -2655,7 +2655,7 @@ dependencies = [
 
 [[package]]
 name = "polymarket-btc-bot"
-version = "1.5.0"
+version = "1.8.0"
 dependencies = [
  "alloy-primitives",
  "alloy-signer",
