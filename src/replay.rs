@@ -14,6 +14,8 @@ const REFERENCE_INTERVAL_SECS: f64 = 3.0;
 const VOL_WINDOW_OBS: usize = 100;
 const DEFAULT_VOLATILITY: f64 = 0.80;
 const HIGH_VOL_THRESHOLD: f64 = 1.0;
+const MIN_ANNUALIZED_VOL: f64 = 0.15;
+const MIN_CONVICTION: f64 = 0.08;
 
 // ── Data structures ──────────────────────────────────────────────
 
@@ -363,8 +365,11 @@ fn replay_pipeline(evals: &[ReplayEval]) -> Vec<ReplayResult> {
             estimator.add_price(obs.price, obs.timestamp_secs);
         }
 
-        // Snapshot new vol
-        let new_vol = estimator.annualized_volatility().unwrap_or(DEFAULT_VOLATILITY);
+        // Snapshot new vol (with floor)
+        let new_vol = estimator
+            .annualized_volatility()
+            .unwrap_or(DEFAULT_VOLATILITY)
+            .max(MIN_ANNUALIZED_VOL);
 
         // Recompute model probability
         let new_model_p = if eval.model_type == "updown_directional" {
@@ -407,8 +412,11 @@ fn replay_pipeline(evals: &[ReplayEval]) -> Vec<ReplayResult> {
 
         let new_net_edge = new_gross_edge - eval.cost_total;
 
-        // Threshold gate
-        let new_action = if new_net_edge >= eval.effective_threshold {
+        // Conviction floor + threshold gate
+        let conviction = (new_adjusted - 0.5).abs();
+        let new_action = if MIN_CONVICTION > 0.0 && conviction < MIN_CONVICTION {
+            "no_trade".to_string()
+        } else if new_net_edge >= eval.effective_threshold {
             "trade_candidate".to_string()
         } else {
             "no_trade".to_string()
@@ -558,6 +566,114 @@ fn print_replay_report(results: &[ReplayResult], settled: &HashMap<String, Settl
         side_flipped,
         side_flipped as f64 / total as f64 * 100.0
     );
+
+    // ── Brier Score Comparison ─────────────────────────────────
+    println!("\n=== Brier Score Comparison (settled trade_candidates) ===\n");
+
+    // Match replay results to settled outcomes for Brier computation.
+    // Use the last trade_candidate per condition_id (deduped).
+    let mut old_brier_pairs: Vec<(f64, bool)> = Vec::new(); // (predicted_yes_prob, actual_yes)
+    let mut new_brier_pairs: Vec<(f64, bool)> = Vec::new();
+    let mut old_brier_by_asset: HashMap<String, Vec<(f64, bool)>> = HashMap::new();
+    let mut new_brier_by_asset: HashMap<String, Vec<(f64, bool)>> = HashMap::new();
+
+    // Dedup: keep last trade_candidate per condition_id for old and new
+    let mut old_tc_by_cid: HashMap<&str, &ReplayResult> = HashMap::new();
+    let mut new_tc_by_cid: HashMap<&str, &ReplayResult> = HashMap::new();
+    for r in results {
+        if r.old_action == "trade_candidate" {
+            old_tc_by_cid.insert(&r.condition_id, r);
+        }
+        if r.new_action == "trade_candidate" {
+            new_tc_by_cid.insert(&r.condition_id, r);
+        }
+    }
+
+    for (cid, r) in &old_tc_by_cid {
+        if let Some(st) = settled.get(*cid) {
+            old_brier_pairs.push((r.old_posterior, st.actual_yes_outcome));
+            old_brier_by_asset
+                .entry(r.asset.clone())
+                .or_default()
+                .push((r.old_posterior, st.actual_yes_outcome));
+        }
+    }
+    for (cid, r) in &new_tc_by_cid {
+        if let Some(st) = settled.get(*cid) {
+            new_brier_pairs.push((r.new_adjusted_posterior, st.actual_yes_outcome));
+            new_brier_by_asset
+                .entry(r.asset.clone())
+                .or_default()
+                .push((r.new_adjusted_posterior, st.actual_yes_outcome));
+        }
+    }
+
+    let calc_brier = |pairs: &[(f64, bool)]| -> f64 {
+        if pairs.is_empty() {
+            return 0.0;
+        }
+        let sum: f64 = pairs
+            .iter()
+            .map(|(p, actual)| {
+                let outcome = if *actual { 1.0 } else { 0.0 };
+                (p - outcome).powi(2)
+            })
+            .sum();
+        sum / pairs.len() as f64
+    };
+
+    let old_brier = calc_brier(&old_brier_pairs);
+    let new_brier = calc_brier(&new_brier_pairs);
+    let delta = new_brier - old_brier;
+    let arrow = if delta < -0.005 {
+        "  <- better"
+    } else if delta > 0.005 {
+        "  <- worse"
+    } else {
+        ""
+    };
+
+    println!(
+        "  OLD Brier: {:.4}  (N={})    0.25 = random",
+        old_brier,
+        old_brier_pairs.len()
+    );
+    println!(
+        "  NEW Brier: {:.4}  (N={})    lower = better{}",
+        new_brier,
+        new_brier_pairs.len(),
+        arrow
+    );
+    println!("  Delta:     {:+.4}", delta);
+
+    // Per-asset breakdown
+    let assets = ["BTC", "ETH", "SOL", "XRP"];
+    println!(
+        "\n  {:<6} {:>10} {:>6} {:>10} {:>6} {:>8}",
+        "Asset", "OLD Brier", "N", "NEW Brier", "N", "Δ"
+    );
+    println!("  {}", "-".repeat(52));
+    for asset in &assets {
+        let ob = old_brier_by_asset
+            .get(*asset)
+            .map(|v| (calc_brier(v), v.len()))
+            .unwrap_or((0.0, 0));
+        let nb = new_brier_by_asset
+            .get(*asset)
+            .map(|v| (calc_brier(v), v.len()))
+            .unwrap_or((0.0, 0));
+        if ob.1 > 0 || nb.1 > 0 {
+            let d = if ob.1 > 0 && nb.1 > 0 {
+                nb.0 - ob.0
+            } else {
+                0.0
+            };
+            println!(
+                "  {:<6} {:>10.4} {:>6} {:>10.4} {:>6} {:>+8.4}",
+                asset, ob.0, ob.1, nb.0, nb.1, d
+            );
+        }
+    }
 
     // ── Hypothetical P&L ─────────────────────────────────────────
     println!("\n=== Hypothetical P&L (settled markets) ===\n");
