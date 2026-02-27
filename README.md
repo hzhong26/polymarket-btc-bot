@@ -24,7 +24,7 @@ Built in Rust for low-latency execution (~2-6s tick-to-order).
 
 ```
                           +------------------+
-                          |   Gamma Scanner  |  (30s poll)
+                          |   Gamma Scanner  |  (30s poll + boundary scan)
                           | market discovery |
                           +--------+---------+
                                    |
@@ -44,7 +44,7 @@ Built in Rust for low-latency execution (~2-6s tick-to-order).
                     |              |              |
               +-----v----+  +-----v----+  +-----v----+
               | Dashboard |  |  JSONL   |  | Trade    |
-              | (browser) |  |  Logger  |  | Sheet CSV|
+              | (browser) |  |  Logger  |  | Sheet    |
               +----------+  +----------+  +----------+
 ```
 
@@ -57,7 +57,7 @@ Built in Rust for low-latency execution (~2-6s tick-to-order).
 | Module | Path | Purpose |
 |--------|------|---------|
 | **trading_loop** | `src/trading_loop/` | Core orchestrator: scan, evaluate, execute, settle |
-| **bayesian** | `src/bayesian/` | Probability models (GBM, directional), EWMA volatility, calibration |
+| **bayesian** | `src/bayesian/` | Probability models (GBM, directional), time-aware EWMA volatility, calibration |
 | **kelly** | `src/kelly/` | Kelly criterion position sizing with uncertainty haircut |
 | **edge** | `src/edge/` | Net edge calculation with dynamic fee model & fee asymmetry detection |
 | **price_feeds** | `src/price_feeds/` | Multi-source aggregation: Chainlink, Binance, Coinbase, CoinGecko, CryptoCompare |
@@ -68,7 +68,8 @@ Built in Rust for low-latency execution (~2-6s tick-to-order).
 | **lmsr** | `src/lmsr/` | LMSR pricing engine (theoretical cross-check) |
 | **dashboard_server** | `src/dashboard_server.rs` | Real-time browser dashboard (axum HTTP/WS + embedded Chart.js) |
 | **config** | `src/config/` | Configuration types & TOML loading |
-| **analyze** | `src/analyze.rs` | Post-session analysis: calibration curves, tuning recommendations |
+| **analyze** | `src/analyze.rs` | Post-session analysis: calibration curves, Brier decomposition, tuning recommendations |
+| **backtest** | `src/backtest.rs` | Parameter sweep backtester replaying logged pipeline evaluations |
 | **timezone** | `src/timezone.rs` | Eastern Time conversion (Polymarket market windows use ET) |
 
 ---
@@ -76,7 +77,7 @@ Built in Rust for low-latency execution (~2-6s tick-to-order).
 ## How It Works
 
 ### 1. Market Discovery
-The **Gamma Scanner** polls Polymarket's Gamma API every 30 seconds for binary crypto markets (BTC/ETH/SOL/XRP) expiring within 5-15 minutes. Markets are filtered by liquidity, spread, and tag.
+The **Gamma Scanner** polls Polymarket's Gamma API every 30 seconds for binary crypto markets (BTC/ETH/SOL/XRP) expiring within 5-15 minutes. An immediate scan is also dispatched at every 5-minute boundary crossing to discover new markets without waiting for the timer. Markets are filtered by liquidity, spread, and tag.
 
 ### 2. Price Aggregation
 Five independent price feeds publish to an **aggregator** that:
@@ -90,7 +91,11 @@ For each active market, the bot computes a **posterior probability**:
 - **Up/Down markets** (e.g., "BTC Up or Down?"): Directional model with annualized drift from EWMA
 - **Confidence shrinkage**: Blends model output with market-implied price weighted by feed confidence
 
-**Volatility** is estimated per-asset using EWMA (lambda=0.94 default; XRP/SOL override to 0.90 for faster reaction). Regime detection flags high-vol environments.
+**Volatility** is estimated per-asset using a time-aware EWMA that:
+- Tracks actual inter-observation timestamps (not assumed uniform spacing)
+- Uses time-weighted decay: `λ_eff = exp(-dt / half_life)` with variance stored per-second
+- Prefers raw Binance observations over aggregated median for highest-fidelity signal
+- Guards against too-fast ticks (<50ms) and reconnect gaps (>30s)
 
 ### 4. Edge Calculation
 **Gross edge** = posterior probability - market price, computed for both sides (YES and NO).
@@ -114,12 +119,18 @@ Before any order, the pipeline checks:
 - Liquidity >= $1,000
 - Time to expiry >= 60s
 - Dynamic threshold (base + confidence/spread/calibration penalties)
-- YES-side multiplier (configurable, default 1.2x)
-- Max net edge cap (configurable, rejects suspiciously large edges)
+- Side multipliers (YES default 1.0x, NO default 1.2x — configurable)
+- Max net edge cap (rejects suspiciously large edges)
 - Risk limits (position size, total exposure, drawdown, cooldown)
 
 ### 7. Execution & Settlement
-Orders are placed via the CLOB API. Fills arrive over WebSocket. At market expiry, Polymarket resolves the outcome and P&L is locked in. The calibration tracker records the prediction vs. actual outcome for future uncertainty estimation.
+**Paper mode**: Orders go through a pending order lifecycle with simulated fills based on orderbook state. **Live mode**: Orders placed via the CLOB API with fills arriving over WebSocket. At market expiry, the bot polls Gamma API for official resolution (with backoff). P&L is locked in and the calibration tracker records the prediction vs. actual outcome.
+
+### 8. Reference Price Capture
+At 5-minute boundary crossings:
+1. Chainlink one-shot captures reference prices for all assets (3s grace period)
+2. Immediate market scan dispatches to discover new markets
+3. Reference cache is keyed by (asset, window_start) to deduplicate across markets
 
 ---
 
@@ -168,17 +179,20 @@ Chainlink contract addresses (BTC/ETH/SOL/XRP on Polygon), Binance WS URL, Coinb
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `edge_threshold` | `0.11` | Minimum net edge (11%) to trade |
-| `kelly_fraction` | `0.12` | Fractional Kelly multiplier |
+| `kelly_fraction` | `0.20` | Fractional Kelly multiplier |
 | `uncertainty_haircut_max` | `0.90` | Reject if model uncertainty > 90% |
 | `latency_penalty` | `0.005` | 0.5% execution slippage hedge |
 | `market_tags` | BTC, ETH, XRP, SOL | Asset universe |
 | `market_duration_max_secs` | `900` | Max market window (15 min) |
 | `fee_rate` / `fee_exponent` | `0.25` / `2` | Polymarket dynamic fee formula |
 | `max_net_edge` | `0.20` | Reject edges above this cap |
-| `yes_edge_threshold_mult` | `1.2` | YES trades need 20% more edge |
+| `yes_edge_threshold_mult` | `1.0` | YES-side edge multiplier |
+| `no_edge_threshold_mult` | `1.2` | NO trades need 20% more edge |
 | `ewma_lambda` | `0.94` | EWMA decay factor (global default) |
 | `vol_window_secs` | `300` | Volatility estimation window |
-| `paper_bankroll_usdc` | `10000` | Simulated bankroll for paper mode |
+| `paper_bankroll_usdc` | `2000` | Simulated bankroll for paper mode |
+| `obi_weight` | `0.0` | Orderbook imbalance signal weight (0 = disabled) |
+| `obi_depth_levels` | `5` | Orderbook levels for OBI calculation |
 
 ### `[trading.asset_params.*]`
 Per-asset overrides for edge threshold multiplier, uncertainty multiplier, and EWMA lambda.
@@ -186,15 +200,18 @@ Per-asset overrides for edge threshold multiplier, uncertainty multiplier, and E
 ### `[risk]`
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `max_position_usdc` | `500` | Max single position |
-| `max_total_exposure` | `2000` | Max total deployed capital |
+| `max_position_usdc` | `50` | Max single position (paper) |
+| `max_total_exposure` | `200` | Max total deployed capital (paper) |
 | `max_drawdown_pct` | `0.50` | Halt at 50% drawdown |
 | `cooldown_after_loss_ms` | `60000` | 60s pause after consecutive losses |
 | `max_consecutive_losses` | `3` | Trigger cooldown after 3 losses |
 | `max_open_orders` | `10` | Max concurrent orders |
 
+### `[risk.live]`
+Live-mode overrides for risk limits (separate from paper-mode defaults).
+
 ### `[logging]`
-Console log level/format, Prometheus metrics port, dashboard port, and JSONL file logging settings (directory, flush interval, no-trade sampling rate, gzip compression).
+Console log level/format, Prometheus metrics port, dashboard port (paper: 8080, live: 8081), and JSONL file logging settings (directory, flush interval, no-trade sampling rate, gzip compression).
 
 ---
 
@@ -210,80 +227,95 @@ polymarket-btc-bot [config.toml] --paper
 # Disable JSONL logging
 polymarket-btc-bot [config.toml] --no-log
 
-# Post-session analysis (calibration curves, tuning recommendations)
+# Post-session analysis (calibration curves, Brier decomposition, tuning recs)
 polymarket-btc-bot --analyze [log-dirs...]
+
+# Filter analysis by run number
+polymarket-btc-bot --analyze logs/2026-02-25 --run 3
 
 # List run summaries
 polymarket-btc-bot --runs [log-dirs...]
 
-# Filter analysis by condition or tag
-polymarket-btc-bot --analyze logs/ --run bitcoin
+# Parameter sweep backtester (replays logged pipeline evaluations)
+polymarket-btc-bot --backtest [log-dir] [--run N]
 ```
 
 ---
 
 ## Dashboard
 
-A real-time browser dashboard is served on `http://localhost:8080` (configurable).
+A real-time browser dashboard is served on `http://localhost:8080` (paper) or `http://localhost:8081` (live).
 
 **Features**:
-- Live P&L chart (Chart.js) with timeframe filters (5m / 15m / 1h / 6h / 1d)
+- Live P&L chart (Chart.js) with timeframe filters (Live / 5m / 15m / 1h / 6h / 1d)
 - Open positions with mark-to-market updates
-- Trade history (opened/closed) with click-to-expand diagnostics
+- Trade history with three tabs: Pending / Open / Closed
+- Pending orders with yellow flashcards (hourglass badge, diagnostics on click)
+- Click-to-expand diagnostics modal for any trade
 - WebSocket protocol for instant updates
 
 **Protocol**:
-- On connect: full state snapshot (`init` message with all snaps, opened, closed)
+- On connect: full state snapshot (`init` message with snaps, opened, closed, pending)
 - Live: `snap` messages with P&L fields + position cards on every evaluation tick
-- Trade events: `opened` and `closed` messages with full diagnostics
+- Trade events: `pending`, `pending_remove`, `opened`, `closed` messages with full diagnostics
 
 ---
 
 ## Versioning
 
+### v1.8.0 — Time-Aware Volatility & Raw Price Signal
+*Tag: `v1.8.0`*
+
+Two critical vol estimation fixes:
+- **Time-aware EWMA**: Decay is now proportional to actual elapsed time between observations (`λ_eff = exp(-dt/τ)`) instead of treating irregular ticks as uniform. Variance stored per-second eliminates assumed tick interval.
+- **Raw Binance signal**: Vol estimator now extracts the undampened Binance observation instead of the aggregated median (which was smoothed by slow sources like CoinGecko at 45s update rate).
+- **Boundary scan dispatch**: Immediate market scan at 5-minute boundaries so new markets are discovered without waiting for the 30s timer.
+- **Live-mode dashboard**: Separate port (8081) and log directory for live trading.
+- **Live-mode risk overrides**: `[risk.live]` config section for separate paper/live risk limits.
+
+### v1.5.0 — Simplified Baseline + OBI Infrastructure
+*Tag: `v1.5.0`*
+
+Config simplification back to Run 8 baseline (best performing):
+- Reverted over-tuned per-asset multipliers, edge threshold, and EWMA overrides
+- **OBI infrastructure** (P6): Orderbook imbalance signal plumbed through but disabled (`obi_weight=0.0`)
+- Concurrent orderbook fetches to fix select loop starvation
+- Scan timeout and Chainlink RPC timeout (3s each)
+- Pending order lifecycle for paper mode
+
+### v1.4.0 — Backtest & Analysis Improvements
+*Tag: `v1.4.0`*
+
+- **`--backtest` parameter sweep**: Replays logged pipeline evaluations with different configs
+- **Brier decomposition** (P14): Reliability, resolution, uncertainty breakdown per asset
+- **XLSX trade sheets**: Per-run analysis blocks with open/closed trade tracking
+- **Pending order fill analysis**: Fill rate breakdown by asset and side in `--analyze`
+
+### v1.1.0 — Post-Run Tuning
+*Tag: `v1.1.0`*
+
+- **Max net edge cap** (`max_net_edge=0.20`): Rejects suspiciously large edges (>20% had 33% WR)
+- **NO-side edge multiplier** (`no_edge_threshold_mult=1.2`): NO side needs 20% more edge
+- **Chainlink feeds for all 4 assets** (previously BTC-only)
+- **ET date directories** for logs matching Polymarket market windows
+- **Per-asset EWMA lambda** and edge threshold overrides
+- **`--analyze` mode** with calibration curves, edge buckets, side/TTE breakdown
+
 ### v1.0.0 — Functionally Complete Baseline
 *Tag: `v1.0.0` | Commit: `fe6b513`*
 
-The initial release with all core systems operational:
-
-- **Trading Loop**: Full scan → evaluate → execute → settle pipeline
-- **Bayesian Models**: GBM (strike markets) and directional (up/down markets) probability estimation
-- **EWMA Volatility**: Per-asset exponentially weighted moving average with regime detection
-- **Kelly Criterion**: Fractional Kelly sizing with Brier-score uncertainty haircut
-- **Dynamic Fee Model**: Polymarket's quadratic fee formula (`fee_rate * (p*(1-p))^exponent`)
-- **Fee Asymmetry Detection**: Picks the side with better net edge after fees, not just best gross edge
-- **5 Price Feeds**: Chainlink (on-chain), Binance (WebSocket), Coinbase, CoinGecko, CryptoCompare
-- **Price Aggregator**: Median with quorum, anomaly rejection, confidence scoring
-- **Dual Venue Support**: International (EIP-712 on Polygon) and US (EdDSA)
-- **Risk Management**: Position limits, exposure caps, drawdown halt, consecutive-loss cooldown, kill switch
-- **Paper Mode**: Full simulation with in-memory fills and self-resolution
-- **Dashboard**: Real-time browser dashboard (axum + Chart.js) with WebSocket updates
-- **JSONL Logging**: Structured event logs with sampled no-trade events, gzip on roll
-- **Trade Sheet**: CSV trade log with ET date directories
-- **Post-Session Analysis**: `--analyze` mode with calibration curves, Brier scores, and tuning recommendations
-- **Auto-Calibration**: Rolling Brier score per asset feeds into Kelly uncertainty haircut at runtime
-- **Per-Asset Tuning**: Configurable edge threshold multipliers, uncertainty multipliers, EWMA lambda overrides per asset (BTC, ETH, SOL, XRP)
-- **Confidence Shrinkage**: Model predictions blended toward market-implied price when feed confidence is low
-
-### v1.1.0 — Post-Run Tuning & Multi-Asset Improvements
-*Tag: `v1.1.0`*
-
-Updates driven by analysis of the v1.0.0 run (131 settled trades, Feb 24-25):
-
-**Tuning knobs from run analysis:**
-- **Max net edge cap** (`max_net_edge = 0.20`): Rejects trades with suspiciously large edges. Data showed edge >0.20 had only 33% win rate and lost money — likely model overconfidence or stale data rather than real opportunity.
-- **YES-side edge multiplier** (`yes_edge_threshold_mult = 1.2`): YES trades must clear 20% higher threshold. Run data: YES = 40.5% win rate / -$16 avg P&L vs NO = 63.8% win rate / +$82 avg P&L.
-
-**Multi-asset & infrastructure:**
-- **Chainlink feeds for all 4 assets**: Previously BTC-only; now BTC, ETH, SOL, XRP all have on-chain oracle feeds on Polygon
-- **ET date directories for CSV logs**: Log directories now use Eastern Time dates (matching Polymarket market windows) instead of UTC, preventing split directories around midnight
-- **Paper-mode self-resolution**: Markets resolve immediately at expiry in paper mode without waiting for Gamma API polling (eliminates 10+ min settlement delays)
-- **Dashboard snap buffer increase**: Buffer increased to 20K+ snapshots with client-side downsampling for smoother charting
-- **Dashboard snap throttle in paper mode**: Reduces WebSocket message frequency during high-speed paper simulation
-- **Per-asset EWMA lambda overrides**: XRP and SOL use lambda=0.90 (faster reaction) vs global default 0.94
-- **Per-asset edge threshold multipliers**: XRP at 1.5x, SOL at 2.5x base threshold (noisier assets need more edge)
-- **Trade sheet CSV logging**: Run-level headers, open/closed trade tracking, condition-level deduplication
-- **Analyze module** (`--analyze`): Post-session analysis with edge buckets, side breakdown, TTE analysis, and tuning recommendations
+Initial release with all core systems:
+- Trading loop: scan, evaluate, execute, settle pipeline
+- Bayesian models: GBM (strike) and directional (up/down) probability estimation
+- EWMA volatility with regime detection
+- Kelly criterion with Brier-score uncertainty haircut
+- Dynamic fee model with fee asymmetry detection
+- 5 price feeds with median aggregation, quorum, anomaly rejection
+- Dual venue support (International EIP-712, US EdDSA)
+- Risk management: position limits, drawdown halt, cooldown, kill switch
+- Paper mode with simulated fills
+- Real-time browser dashboard (axum + Chart.js)
+- JSONL structured logging
 
 ---
 
@@ -295,13 +327,19 @@ Updates driven by analysis of the v1.0.0 run (131 settled trades, Feb 24-25):
 | P1a | Per-Asset Volatility | Done |
 | P1b | EWMA Volatility | Done |
 | P5 | Fee-Asymmetric Edge | Done |
-| P2 | Implied Vol Calibration (IV-RV) | Planned |
-| P3a | TTE Sweet Spot Filtering | Planned |
+| P3a | TTE Sweet Spot Filtering | Done |
+| P6 | Orderbook Imbalance Signal | Done (infra, disabled) |
+| P14 | Brier Decomposition | Done |
 | P3b | TTE Vol Scaling | Planned |
 | P4 | Cross-Asset Lead-Lag (BTC -> alts) | Planned |
-| P6 | Orderbook Imbalance Signal | Planned |
+| P2 | Implied Vol Calibration (IV-RV) | Planned |
 | P7 | Regime-Aware Kelly Sizing | Planned |
-| P8 | Ensemble Model Blending | Planned |
+| P8 | Ensemble Model Blending | Backlog |
+| P9 | Probability Shrinkage | Rejected |
+| P10 | Side Bias Adjustment | Backlog |
+| P11 | Drawdown-Adaptive Sizing | Backlog |
+| P12 | Slippage Model | Backlog |
+| P13 | Correlation-Based Sizing | Backlog |
 
 ---
 
@@ -313,13 +351,14 @@ Updates driven by analysis of the v1.0.0 run (131 settled trades, Feb 24-25):
 **Time**: chrono | **Regex**: regex | **Env**: dotenvy
 **Observability**: tracing, tracing-subscriber, metrics, metrics-exporter-prometheus
 **TLS**: rustls (ring provider) | **Error handling**: anyhow, thiserror
+**Spreadsheet**: rust_xlsxwriter
 
 ---
 
 ## Testing
 
 ```bash
-cargo test          # 265 unit tests
+cargo test          # 279 unit tests
 cargo bench         # LMSR + Bayesian benchmarks
 ```
 
