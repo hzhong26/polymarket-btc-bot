@@ -316,10 +316,17 @@ pub struct LoggingConfig {
     pub jsonl: JsonlLoggingConfig,
     #[serde(default = "default_dashboard_port")]
     pub dashboard_port: u16,
+    /// Dashboard port used in live mode (default 8081).
+    #[serde(default = "default_live_dashboard_port")]
+    pub live_dashboard_port: u16,
 }
 
 fn default_dashboard_port() -> u16 {
     8080
+}
+
+fn default_live_dashboard_port() -> u16 {
+    8081
 }
 
 #[derive(Debug, Clone, Deserialize)]

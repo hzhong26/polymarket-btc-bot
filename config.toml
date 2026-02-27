@@ -5,7 +5,7 @@ venue_type = "international"
 [venue.international]
 clob_url = "https://clob.polymarket.com"
 gamma_url = "https://gamma-api.polymarket.com"
-ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws/"
+ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
 chain_id = 137
 # proxy_wallet = "0xYOUR_PROXY_WALLET"
 
@@ -131,6 +131,7 @@ level = "info"
 format = "pretty"
 metrics_port = 9090
 dashboard_port = 8080
+live_dashboard_port = 8081
 
 [logging.jsonl]
 enabled = true

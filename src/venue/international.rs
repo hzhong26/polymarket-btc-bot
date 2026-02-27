@@ -1575,16 +1575,19 @@ impl VenueClient for InternationalClient {
             })
             .unwrap_or_default();
 
-        let subscribe_payload = serde_json::json!({
+        let mut subscribe_msg = serde_json::json!({
             "auth": {
                 "apiKey": api_key,
                 "secret": api_secret,
                 "passphrase": passphrase
             },
-            "markets": markets,
-            "type": "USER"
-        })
-        .to_string();
+            "type": "user"
+        });
+        // Only include "markets" if explicitly configured; omitting it subscribes to all user events.
+        if !markets.is_empty() {
+            subscribe_msg["markets"] = serde_json::json!(markets);
+        }
+        let subscribe_payload = subscribe_msg.to_string();
 
         let mut backoff = Duration::from_secs(1);
         let max_backoff = Duration::from_secs(30);

@@ -254,13 +254,21 @@ async fn main() -> anyhow::Result<()> {
     let clock_guard = ClockGuard::new(app_config.risk.max_quote_age_ms);
     let kill_switch = KillSwitch::new(&app_config.risk.ws_disconnect_action);
     let run_metadata = RunMetadata::new(paper_mode, venue_ref.venue_type(), &config_debug);
-    let event_logger = EventLoggerHandle::new(app_config.logging.jsonl.clone(), run_metadata);
+    let mut jsonl_config = app_config.logging.jsonl.clone();
+    if !paper_mode {
+        jsonl_config.dir = format!("{}/live", jsonl_config.dir);
+    }
+    let event_logger = EventLoggerHandle::new(jsonl_config, run_metadata);
 
     // Spawn browser dashboard server
     let dashboard_state = make_dashboard_state();
     {
         let state_clone = Arc::clone(&dashboard_state);
-        let port = app_config.logging.dashboard_port;
+        let port = if paper_mode {
+            app_config.logging.dashboard_port
+        } else {
+            app_config.logging.live_dashboard_port
+        };
         tokio::spawn(async move {
             run_dashboard_server(state_clone, port).await;
         });
@@ -748,6 +756,7 @@ mod tests {
                 metrics_port: 9090,
                 jsonl: config::JsonlLoggingConfig::default(),
                 dashboard_port: 8080,
+                live_dashboard_port: 8081,
             },
         }
     }

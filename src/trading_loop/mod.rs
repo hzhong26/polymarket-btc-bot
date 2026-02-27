@@ -147,7 +147,7 @@ impl TradingLoop {
             calibration_by_asset: PriceAsset::ALL
                 .into_iter()
                 .map(|asset| {
-                    let path = std::path::PathBuf::from("logs")
+                    let path = std::path::PathBuf::from(event_logger.log_dir())
                         .join(format!("calibration_{}.json", asset.symbol().to_lowercase()));
                     let tracker = CalibrationTracker::load(&path, 500).unwrap_or_else(|_| {
                         info!(
@@ -1828,7 +1828,7 @@ impl TradingLoop {
                     rec.actual_yes_outcome,
                     rec.market_question.clone(),
                 );
-                let path = std::path::PathBuf::from("logs")
+                let path = std::path::PathBuf::from(self.event_logger.log_dir())
                     .join(format!("calibration_{}.json", rec.asset.symbol().to_lowercase()));
                 if let Err(e) = cal.save(&path) {
                     warn!(
