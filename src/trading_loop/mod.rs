@@ -443,6 +443,11 @@ impl TradingLoop {
                         "5-minute boundary reached, capturing reference prices"
                     );
                     self.capture_reference_at_boundary(current_boundary).await;
+                    // Force immediate scan so new markets are discovered promptly
+                    if !self.scan_in_flight {
+                        info!("boundary scan: dispatching immediate scan after 5-min boundary");
+                        self.dispatch_scan(venue.clone());
+                    }
                 }
             }
 
