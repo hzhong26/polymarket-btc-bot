@@ -112,6 +112,8 @@ pub struct TradingLoop {
     dashboard_state: Option<SharedState>,
     trade_sheet: Option<trade_sheet::TradeSheetWriter>,
     last_price_received: tokio::time::Instant,
+    /// Send condition IDs to the user websocket for dynamic subscription.
+    ws_market_tx: tokio::sync::mpsc::Sender<String>,
 }
 
 impl TradingLoop {
@@ -132,6 +134,7 @@ impl TradingLoop {
         starting_capital: rust_decimal::Decimal,
         event_logger: EventLoggerHandle,
         dashboard_state: SharedState,
+        ws_market_tx: tokio::sync::mpsc::Sender<String>,
     ) -> Self {
         let dashboard_enabled = config.dashboard_enabled;
         let dashboard_live_interval = Duration::from_millis(config.dashboard_live_interval_ms);
@@ -204,6 +207,7 @@ impl TradingLoop {
             drawdown_halt: None,
             dashboard_state: Some(dashboard_state),
             last_price_received: tokio::time::Instant::now(),
+            ws_market_tx,
         }
     }
 
@@ -1456,6 +1460,9 @@ impl TradingLoop {
                         .await
                     {
                         Ok(order_id) => {
+                            // Notify user websocket to subscribe to this market's fills.
+                            let _ = self.ws_market_tx.try_send(market.condition_id.clone());
+
                             self.event_logger.try_log_value(
                                 "order_submitted",
                                 serde_json::json!({

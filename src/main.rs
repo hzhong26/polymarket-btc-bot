@@ -192,12 +192,13 @@ async fn main() -> anyhow::Result<()> {
 
     // Subscribe to venue fill events
     let venue_ref: &dyn VenueClient = venue.as_ref();
+    let (ws_market_tx, ws_market_rx) = tokio::sync::mpsc::channel::<String>(64);
     if !paper_mode {
         let fill_tx = order_event_tx.clone();
         let fill_shutdown = shutdown.clone();
         let fill_venue = Arc::clone(&venue);
         tokio::spawn(async move {
-            if let Err(e) = fill_venue.subscribe_fills(fill_tx, fill_shutdown).await {
+            if let Err(e) = fill_venue.subscribe_fills(fill_tx, ws_market_rx, fill_shutdown).await {
                 error!(error = %e, "failed to subscribe to fill events");
             }
         });
@@ -237,7 +238,16 @@ async fn main() -> anyhow::Result<()> {
     let starting_balance = if paper_mode {
         paper_bankroll
     } else {
-        venue_ref.get_balance().await.unwrap_or_default()
+        match venue_ref.get_balance().await {
+            Ok(bal) => {
+                info!(balance = %bal, "fetched live CLOB balance");
+                bal
+            }
+            Err(e) => {
+                error!(error = %e, "failed to fetch CLOB balance, defaulting to 0");
+                Decimal::ZERO
+            }
+        }
     };
     let mut risk_config = app_config.risk.clone();
     if !paper_mode {
@@ -291,6 +301,7 @@ async fn main() -> anyhow::Result<()> {
         starting_balance,
         event_logger,
         dashboard_state,
+        ws_market_tx,
     );
 
     info!("starting trading loop");

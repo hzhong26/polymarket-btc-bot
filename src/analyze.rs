@@ -1557,11 +1557,8 @@ fn report_ewma_lambda_grid(
         for &lambda in &lambdas {
             // Replay all observations through a VolatilityEstimator with this lambda.
             // Use 100-obs window and record vol at each timestamp.
-            let mut estimator = VolatilityEstimator::new(100, 1.0, lambda);
-            let mut vol_by_ts: Vec<(DateTime<Utc>, f64)> = Vec::new();
-
-            // Estimate tick interval from observations
-            let tick_secs = if obs.len() >= 2 {
+            // Estimate reference interval from observations for λ→half-life conversion.
+            let reference_interval = if obs.len() >= 2 {
                 let total_span =
                     (obs.last().unwrap().timestamp - obs.first().unwrap().timestamp).num_seconds()
                         as f64;
@@ -1569,10 +1566,15 @@ fn report_ewma_lambda_grid(
             } else {
                 3.0
             };
+            let mut estimator =
+                VolatilityEstimator::new(100, 1.0, lambda, reference_interval);
+            let mut vol_by_ts: Vec<(DateTime<Utc>, f64)> = Vec::new();
 
             for o in obs {
-                estimator.add_price(o.price);
-                if let Some(vol) = estimator.annualized_volatility(tick_secs) {
+                let ts_secs = o.timestamp.timestamp() as f64
+                    + o.timestamp.timestamp_subsec_millis() as f64 / 1000.0;
+                estimator.add_price(o.price, ts_secs);
+                if let Some(vol) = estimator.annualized_volatility() {
                     vol_by_ts.push((o.timestamp, vol));
                 }
             }

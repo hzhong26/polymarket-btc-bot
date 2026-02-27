@@ -84,6 +84,7 @@ impl VenueClient for UsClient {
     async fn subscribe_fills(
         &self,
         _tx: tokio::sync::mpsc::Sender<OrderEvent>,
+        _market_rx: tokio::sync::mpsc::Receiver<String>,
         _shutdown: tokio_util::sync::CancellationToken,
     ) -> Result<(), VenueError> {
         warn!("US venue fill subscription not yet implemented");

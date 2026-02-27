@@ -18,7 +18,7 @@ use std::str::FromStr;
 use std::sync::Mutex;
 use std::time::Duration;
 use tokio_tungstenite::tungstenite;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::InternationalVenueConfig;
 use crate::market_scanner::TargetMarket;
@@ -1547,6 +1547,7 @@ impl VenueClient for InternationalClient {
     async fn subscribe_fills(
         &self,
         tx: tokio::sync::mpsc::Sender<OrderEvent>,
+        mut market_rx: tokio::sync::mpsc::Receiver<String>,
         shutdown: tokio_util::sync::CancellationToken,
     ) -> Result<(), VenueError> {
         let api_key = read_env_any(&["POLY_API_KEY", "POLYMARKET_API_KEY"]).ok_or_else(|| {
@@ -1565,29 +1566,22 @@ impl VenueClient for InternationalClient {
                 )
             })?;
 
-        let markets: Vec<String> = read_env_any(&["POLY_WS_MARKETS"])
-            .map(|v| {
-                v.split(',')
-                    .map(|s| s.trim())
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.to_string())
-                    .collect()
-            })
-            .unwrap_or_default();
+        // Seed with any statically configured markets from env.
+        let mut subscribed: std::collections::HashSet<String> =
+            read_env_any(&["POLY_WS_MARKETS"])
+                .map(|v| {
+                    v.split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
 
-        let mut subscribe_msg = serde_json::json!({
-            "auth": {
-                "apiKey": api_key,
-                "secret": api_secret,
-                "passphrase": passphrase
-            },
-            "type": "user"
+        let auth = serde_json::json!({
+            "apiKey": api_key,
+            "secret": api_secret,
+            "passphrase": passphrase
         });
-        // Only include "markets" if explicitly configured; omitting it subscribes to all user events.
-        if !markets.is_empty() {
-            subscribe_msg["markets"] = serde_json::json!(markets);
-        }
-        let subscribe_payload = subscribe_msg.to_string();
 
         let mut backoff = Duration::from_secs(1);
         let max_backoff = Duration::from_secs(30);
@@ -1597,24 +1591,67 @@ impl VenueClient for InternationalClient {
                 break;
             }
 
-            debug!(ws_url = %self.config.ws_url, "connecting user websocket");
+            // Wait for at least one market before connecting.
+            if subscribed.is_empty() {
+                debug!("user websocket: waiting for first market subscription");
+                tokio::select! {
+                    Some(cid) = market_rx.recv() => {
+                        subscribed.insert(cid);
+                    }
+                    _ = shutdown.cancelled() => break,
+                }
+                continue;
+            }
+
+            debug!(ws_url = %self.config.ws_url, markets = subscribed.len(), "connecting user websocket");
             match tokio_tungstenite::connect_async(&self.config.ws_url).await {
                 Ok((ws_stream, _)) => {
                     backoff = Duration::from_secs(1);
                     let (mut write, mut read) = ws_stream.split();
 
-                    write
-                        .send(tungstenite::Message::Text(subscribe_payload.clone().into()))
+                    let subscribe_payload = serde_json::json!({
+                        "auth": auth,
+                        "type": "user",
+                        "markets": subscribed.iter().collect::<Vec<_>>(),
+                        "assets_ids": [],
+                    })
+                    .to_string();
+
+                    if let Err(e) = write
+                        .send(tungstenite::Message::Text(subscribe_payload.into()))
                         .await
-                        .map_err(|e| {
-                            VenueError::WebSocket(format!("subscribe send failed: {}", e))
-                        })?;
+                    {
+                        warn!(error = %e, "user websocket subscribe send failed");
+                        break;
+                    }
+
+                    info!(markets = subscribed.len(), "user websocket subscribed");
 
                     loop {
                         tokio::select! {
                             _ = shutdown.cancelled() => {
                                 let _ = write.send(tungstenite::Message::Close(None)).await;
                                 return Ok(());
+                            }
+                            // New market from trading loop — re-subscribe with expanded set.
+                            Some(cid) = market_rx.recv() => {
+                                if subscribed.insert(cid) {
+                                    let resub = serde_json::json!({
+                                        "auth": auth,
+                                        "type": "user",
+                                        "markets": subscribed.iter().collect::<Vec<_>>(),
+                                        "assets_ids": [],
+                                    })
+                                    .to_string();
+                                    if let Err(e) = write
+                                        .send(tungstenite::Message::Text(resub.into()))
+                                        .await
+                                    {
+                                        warn!(error = %e, "user websocket re-subscribe failed");
+                                        break;
+                                    }
+                                    info!(markets = subscribed.len(), "user websocket re-subscribed");
+                                }
                             }
                             maybe_msg = read.next() => {
                                 match maybe_msg {
@@ -3117,8 +3154,10 @@ fn read_env_any(names: &[&str]) -> Option<String> {
 }
 
 fn hmac_sha256_base64(secret_base64: &str, message: &str) -> Result<String, String> {
+    // Accept both padded and unpadded base64 (Polymarket API may return either).
     let secret = base64::engine::general_purpose::STANDARD
         .decode(secret_base64)
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(secret_base64))
         .map_err(|e| format!("invalid base64 secret: {}", e))?;
     let mut mac = Hmac::<Sha256>::new_from_slice(&secret)
         .map_err(|e| format!("failed to initialize HMAC: {}", e))?;

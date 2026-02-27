@@ -254,9 +254,11 @@ pub trait VenueClient: Send + Sync {
     async fn cancel_all(&self) -> Result<(), VenueError>;
 
     /// Subscribe to fill events. Sends events to the provided channel.
+    /// `market_rx` receives new condition IDs to add to the subscription dynamically.
     async fn subscribe_fills(
         &self,
         tx: tokio::sync::mpsc::Sender<OrderEvent>,
+        market_rx: tokio::sync::mpsc::Receiver<String>,
         shutdown: tokio_util::sync::CancellationToken,
     ) -> Result<(), VenueError>;
 

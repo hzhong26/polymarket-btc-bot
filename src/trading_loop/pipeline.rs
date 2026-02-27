@@ -40,6 +40,7 @@ pub struct PipelineDiagnostics {
     pub time_to_expiry_secs: f64,
     pub p_model: Option<f64>,
     pub model_volatility: Option<f64>,
+    /// EWMA variance estimate (per-second; annualize via sqrt(var * 31_557_600))
     pub ewma_variance: Option<f64>,
     pub ewma_observations: Option<usize>,
     pub ewma_warmed_up: Option<bool>,
