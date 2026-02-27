@@ -239,7 +239,11 @@ async fn main() -> anyhow::Result<()> {
     } else {
         venue_ref.get_balance().await.unwrap_or_default()
     };
-    let risk_manager = RiskManager::new(app_config.risk.clone(), starting_balance);
+    let mut risk_config = app_config.risk.clone();
+    if !paper_mode {
+        risk_config.apply_live_overrides();
+    }
+    let risk_manager = RiskManager::new(risk_config, starting_balance);
 
     let fee_model = FeeModel::with_dynamic(
         app_config.trading.fee_rate,
@@ -736,6 +740,7 @@ mod tests {
                 max_open_orders: 10,
                 max_quote_age_ms: 5_000,
                 ws_disconnect_action: "cancel-all".into(),
+                live: None,
             },
             logging: config::LoggingConfig {
                 level: "info".into(),

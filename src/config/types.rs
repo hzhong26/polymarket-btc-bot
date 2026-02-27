@@ -272,6 +272,39 @@ pub struct RiskConfig {
     pub max_open_orders: u32,
     pub max_quote_age_ms: u64,
     pub ws_disconnect_action: String,
+    /// Optional overrides applied in live (non-paper) mode.
+    #[serde(default)]
+    pub live: Option<LiveRiskOverrides>,
+}
+
+/// Override subset of risk limits for live trading.
+/// Any field set here replaces the base `[risk]` value when running without `--paper`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LiveRiskOverrides {
+    pub max_position_usdc: Option<Decimal>,
+    pub max_total_exposure: Option<Decimal>,
+    pub max_drawdown_pct: Option<Decimal>,
+    pub max_open_orders: Option<u32>,
+}
+
+impl RiskConfig {
+    /// Apply live overrides in-place (call only when `!paper_mode`).
+    pub fn apply_live_overrides(&mut self) {
+        if let Some(live) = &self.live {
+            if let Some(v) = live.max_position_usdc {
+                self.max_position_usdc = v;
+            }
+            if let Some(v) = live.max_total_exposure {
+                self.max_total_exposure = v;
+            }
+            if let Some(v) = live.max_drawdown_pct {
+                self.max_drawdown_pct = v;
+            }
+            if let Some(v) = live.max_open_orders {
+                self.max_open_orders = v;
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

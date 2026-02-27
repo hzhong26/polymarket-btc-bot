@@ -209,6 +209,7 @@ mod tests {
             max_open_orders: 10,
             max_quote_age_ms: 5000,
             ws_disconnect_action: "cancel-all".into(),
+            live: None,
         }
     }
 

@@ -110,6 +110,7 @@ uncertainty_mult = "1.0"
 ewma_lambda = 0.94
 
 [risk]
+# Paper-mode risk limits (used with --paper)
 max_position_usdc = "50"
 max_total_exposure = "200"
 max_drawdown_pct = "0.50"
@@ -118,6 +119,12 @@ max_consecutive_losses = 3
 max_open_orders = 10
 max_quote_age_ms = 5000
 ws_disconnect_action = "cancel-all"
+
+# Live-mode overrides (applied when running without --paper)
+[risk.live]
+max_position_usdc = "5"
+max_total_exposure = "15"
+max_drawdown_pct = "0.50"
 
 [logging]
 level = "info"
