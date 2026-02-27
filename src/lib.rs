@@ -9,6 +9,7 @@ pub mod kelly;
 pub mod lmsr;
 pub mod market_scanner;
 pub mod price_feeds;
+pub mod replay;
 pub mod risk;
 pub mod timezone;
 pub mod trading_loop;

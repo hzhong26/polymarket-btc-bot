@@ -52,6 +52,9 @@ async fn main() -> anyhow::Result<()> {
     if let Some(dirs) = cli.backtest_dirs {
         return polymarket_btc_bot::backtest::run(&dirs, cli.run_filter.as_deref());
     }
+    if let Some(dirs) = cli.replay_dirs {
+        return polymarket_btc_bot::replay::run(&dirs, cli.run_filter.as_deref());
+    }
     if let Some(dirs) = cli.analyze_dirs {
         return polymarket_btc_bot::analyze::run(&dirs, cli.run_filter.as_deref());
     }
@@ -363,6 +366,7 @@ struct CliArgs {
     analyze_dirs: Option<Vec<String>>,
     runs_dirs: Option<Vec<String>>,
     backtest_dirs: Option<Vec<String>>,
+    replay_dirs: Option<Vec<String>>,
     run_filter: Option<String>,
 }
 
@@ -402,6 +406,7 @@ fn parse_cli_args() -> CliArgs {
             analyze_dirs: None,
             runs_dirs: Some(dirs),
             backtest_dirs: None,
+            replay_dirs: None,
             run_filter: None,
         };
     }
@@ -420,6 +425,26 @@ fn parse_cli_args() -> CliArgs {
             analyze_dirs: None,
             runs_dirs: None,
             backtest_dirs: Some(dirs),
+            replay_dirs: None,
+            run_filter,
+        };
+    }
+
+    let replay_mode = args_without_run.iter().any(|a| a == "--replay");
+    if replay_mode {
+        let dirs: Vec<String> = args_without_run
+            .iter()
+            .filter(|a| !a.starts_with("--"))
+            .cloned()
+            .collect();
+        return CliArgs {
+            config_path: String::new(),
+            paper_mode: false,
+            no_log: false,
+            analyze_dirs: None,
+            runs_dirs: None,
+            backtest_dirs: None,
+            replay_dirs: Some(dirs),
             run_filter,
         };
     }
@@ -439,6 +464,7 @@ fn parse_cli_args() -> CliArgs {
             analyze_dirs: Some(dirs),
             runs_dirs: None,
             backtest_dirs: None,
+            replay_dirs: None,
             run_filter,
         };
     }
@@ -458,6 +484,7 @@ fn parse_cli_args() -> CliArgs {
         analyze_dirs: None,
         runs_dirs: None,
         backtest_dirs: None,
+        replay_dirs: None,
         run_filter: None,
     }
 }
