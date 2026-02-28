@@ -75,7 +75,7 @@ max_net_edge = "0.20"
 # YES-side trades must clear threshold × this multiplier.
 # 999.0 = YES disabled (NO-only). YES had 34% WR, -$1,716 P&L — retail optimism premium.
 # Sweep (9,000 configs, 2 days): every top config disabled YES.
-yes_edge_threshold_mult = "999.0"
+yes_edge_threshold_mult = "3.0"
 # NO-side trades must clear threshold × this multiplier.
 # 1.20 = slightly looser than previous 1.5; NO side had 64% WR in sweep.
 no_edge_threshold_mult = "1.20"

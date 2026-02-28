@@ -54,7 +54,7 @@ impl Default for ReplayConfig {
             reversion_weight: 0.05,
             reversion_negative_mult: 1.5,
             min_conviction: 0.16,
-            yes_edge_threshold_mult: 999.0,
+            yes_edge_threshold_mult: 3.0,
             no_edge_threshold_mult: 1.20,
             threshold_scale: 1.0,
             vol_regime_short_window_secs: 300.0,
@@ -1063,65 +1063,19 @@ fn print_replay_report(results: &[ReplayResult], settled: &HashMap<String, Settl
 // ── Parameter sweep ─────────────────────────────────────────────
 
 fn build_param_grid() -> Vec<ReplayConfig> {
-    let base = ReplayConfig {
-        // Fixed from previous sweep (strongly determined)
-        ewma_lambda: 0.97,
-        min_annualized_vol: 0.10,
-        yes_edge_threshold_mult: 999.0, // NO-only
-        vol_window_obs: 100,
-        ..ReplayConfig::default()
-    };
+    // All v1.9.0 params fixed; sweep only yes_edge_threshold_mult
+    let base = ReplayConfig::default();
 
-    // ── Trade selection ──
-    let min_convictions = [0.08, 0.12, 0.16, 0.20, 0.24];
-    let no_edge_mults = [0.7, 0.85, 1.0, 1.2, 1.5];
-    let threshold_scales = [0.5, 0.7, 0.85, 1.0, 1.15, 1.3];
-
-    // ── Vol regime ──
-    let regime_configs: [(f64, f64, f64, f64); 3] = [
-        (99.0, 1.0, 0.0, 1.0),    // OFF
-        (1.5, 1.5, 0.7, 0.9),     // default
-        (1.3, 1.5, 0.8, 0.9),     // sensitive
+    let yes_mults = [
+        1.0, 1.2, 1.5, 1.8, 2.0, 2.5, 3.0, 4.0, 5.0, 7.0, 10.0, 999.0,
     ];
-
-    // ── Mean reversion (focused from previous sweep: 120s lookback won) ──
-    let reversion_configs: [(f64, f64, f64); 5] = [
-        (0.0,  180.0, 1.5),  // OFF
-        (0.03, 120.0, 1.0),  // medium, symmetric
-        (0.03, 120.0, 1.5),  // medium, asymmetric
-        (0.05, 120.0, 1.5),  // heavy, asymmetric
-        (0.05, 180.0, 1.5),  // heavy, longer
-    ];
-
-    // ── OBI signal ──
-    let obi_weights = [0.0, 0.02, 0.05, 0.10];
 
     let mut grid = Vec::new();
-    for &mc in &min_convictions {
-        for &nem in &no_edge_mults {
-            for &ts in &threshold_scales {
-                for &(et, em, ct, cm) in &regime_configs {
-                    for &(rw, lb, nm) in &reversion_configs {
-                        for &ow in &obi_weights {
-                            grid.push(ReplayConfig {
-                                min_conviction: mc,
-                                no_edge_threshold_mult: nem,
-                                threshold_scale: ts,
-                                vol_regime_expand_threshold: et,
-                                vol_regime_expand_mult: em,
-                                vol_regime_contract_threshold: ct,
-                                vol_regime_contract_mult: cm,
-                                reversion_weight: rw,
-                                reversion_lookback_secs: lb,
-                                reversion_negative_mult: nm,
-                                obi_weight: ow,
-                                ..base.clone()
-                            });
-                        }
-                    }
-                }
-            }
-        }
+    for &ym in &yes_mults {
+        grid.push(ReplayConfig {
+            yes_edge_threshold_mult: ym,
+            ..base.clone()
+        });
     }
     grid
 }
@@ -1136,11 +1090,11 @@ fn compute_sweep_metrics(
         last_by_cid.insert(&r.condition_id, r);
     }
 
-    // Trade candidates only (deduped)
+    // Trade candidates only (deduped — first occurrence, matching replay logic)
     let mut new_by_cid: HashMap<&str, &ReplayResult> = HashMap::new();
     for r in results {
         if r.new_action == "trade_candidate" {
-            new_by_cid.insert(&r.condition_id, r);
+            new_by_cid.entry(&r.condition_id).or_insert(r);
         }
     }
 
@@ -1245,7 +1199,7 @@ fn print_sweep_report(
         let combined_pnl: f64 = day_metrics.iter().map(|m| m.total_pnl).sum();
         let all_profitable = day_metrics.iter().all(|m| m.total_pnl > 0.0);
         let min_trades = day_metrics.iter().map(|m| m.total_trades).min().unwrap_or(0);
-        if min_trades >= 10 {
+        if min_trades >= 1 {
             ranked.push((i, combined_pnl, all_profitable));
         }
     }
@@ -1277,16 +1231,16 @@ fn print_sweep_report(
         }
     };
 
-    print!("  {:>4} {:>5} {:>5} {:>5} {:>4} {:>4} {:>4} {:>4} {:>5}",
-        "Rank", "Conv", "NoMx", "ThSc", "RevW", "Lb", "Rgme", "OBI", "Brier");
+    print!("  {:>4} {:>6} {:>5} {:>5} {:>5} {:>4} {:>4} {:>4} {:>4} {:>5}",
+        "Rank", "YesMx", "Conv", "NoMx", "ThSc", "RevW", "Lb", "Rgme", "OBI", "Brier");
     for (label, _, _) in datasets {
         let short = label.chars().rev().take(5).collect::<String>().chars().rev().collect::<String>();
         print!("  {:>7} {:>5} {:>4}",
             format!("P&L_{short}"), "WR", "N");
     }
     println!("  {:>9} {:>4}", "TOTAL", "Con");
-    print!("  {:>4} {:>5} {:>5} {:>5} {:>4} {:>4} {:>4} {:>4} {:>5}",
-        "----", "-----", "-----", "-----", "----", "----", "----", "----", "-----");
+    print!("  {:>4} {:>6} {:>5} {:>5} {:>5} {:>4} {:>4} {:>4} {:>4} {:>5}",
+        "----", "------", "-----", "-----", "-----", "----", "----", "----", "----", "-----");
     for _ in datasets {
         print!("  {:>7} {:>5} {:>4}", "-------", "-----", "----");
     }
@@ -1314,9 +1268,15 @@ fn print_sweep_report(
         let avg_brier: f64 = day_metrics.iter().map(|m| m.brier_same_set).sum::<f64>()
             / day_metrics.len() as f64;
 
+        let yes_m = if cfg.yes_edge_threshold_mult > 100.0 {
+            "OFF".to_string()
+        } else {
+            format!("{:.1}", cfg.yes_edge_threshold_mult)
+        };
         print!(
-            "  {:>4} {:>5.2} {:>5.2} {:>5.2} {:>4} {:>4} {:>4} {:>4} {:>.4}",
+            "  {:>4} {:>6} {:>5.2} {:>5.2} {:>5.2} {:>4} {:>4} {:>4} {:>4} {:>.4}",
             rank + 1,
+            yes_m,
             cfg.min_conviction,
             cfg.no_edge_threshold_mult,
             cfg.threshold_scale,

@@ -119,7 +119,8 @@ pub async fn run_dashboard_server(state: SharedState, port: u16) {
 // ---------------------------------------------------------------------------
 
 async fn root_handler() -> impl IntoResponse {
-    axum::response::Html(DASHBOARD_HTML)
+    let html = DASHBOARD_HTML.replace("{{VERSION}}", env!("CARGO_PKG_VERSION"));
+    axum::response::Html(html)
 }
 
 async fn ws_handler(
@@ -200,7 +201,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Bot Dashboard</title>
+<title>Bot Dashboard v{{VERSION}}</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -267,10 +268,11 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
   .modal-row .val.neg { color: #f85149; }
 
   /* Page tabs */
-  #page-tabs { display: flex; gap: 4px; margin-bottom: 12px; padding-bottom: 8px; border-bottom: 1px solid #30363d; }
+  #page-tabs { display: flex; align-items: center; gap: 4px; margin-bottom: 12px; padding-bottom: 8px; border-bottom: 1px solid #30363d; }
   .page-tab { background: none; border: none; color: #8b949e; font-size: 14px; cursor: pointer; padding: 6px 18px; border-radius: 6px; font-weight: 500; }
   .page-tab.active { background: #21262d; color: #c9d1d9; }
   .page-tab:hover:not(.active) { background: #161b22; color: #c9d1d9; }
+  .version-badge { margin-left: auto; font-size: 11px; color: #8b949e; background: #21262d; border: 1px solid #30363d; border-radius: 12px; padding: 2px 10px; letter-spacing: .03em; }
 
   /* Trades Sheet */
   #sheet-page { margin-top: 4px; }
@@ -292,6 +294,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
   <div id="page-tabs">
     <button class="page-tab active" id="ptab-dashboard" onclick="showPage('dashboard')">Dashboard</button>
     <button class="page-tab" id="ptab-sheet" onclick="showPage('sheet')">Trades Sheet</button>
+    <span class="version-badge">v{{VERSION}}</span>
   </div>
   <div id="status">Connecting...</div>
   <div id="dashboard-page">
