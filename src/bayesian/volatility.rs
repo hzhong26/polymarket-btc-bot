@@ -210,6 +210,61 @@ impl VolatilityEstimator {
         self.log_returns.len() >= self.window_size / 2
     }
 
+    /// Compute the ratio of short-window realized volatility to long-window (EWMA) volatility.
+    ///
+    /// Returns `short_rv / long_rv` where:
+    /// - `short_rv` is realized vol computed from returns in the last `short_window_secs` seconds
+    /// - `long_rv` is the current EWMA-based annualized vol estimate
+    ///
+    /// Interpretation:
+    /// - `> 1.5` → volatility expanding (regime shift, uncertainty high)
+    /// - `< 0.7` → volatility contracting (range-bound, more predictable)
+    /// - `~1.0`  → stable regime
+    ///
+    /// Returns None if insufficient data for either estimate.
+    pub fn vol_regime_ratio(&self, short_window_secs: f64) -> Option<f64> {
+        let long_vol = self.annualized_volatility()?;
+        if long_vol < 1e-10 {
+            return None;
+        }
+
+        // Compute short-window RV from recent returns within the time window.
+        // Walk backwards through log_returns to find observations within the window.
+        let total_dt: f64 = self.log_returns.iter().map(|(_, dt)| dt).sum();
+        if total_dt < short_window_secs * 0.5 {
+            // Not enough history to fill even half the short window
+            return None;
+        }
+
+        // Accumulate from the back until we exceed short_window_secs
+        let mut sum_r_sq_per_sec = 0.0f64;
+        let mut dt_accum = 0.0f64;
+        let mut n = 0u32;
+
+        for &(r, dt) in self.log_returns.iter().rev() {
+            if dt_accum + dt > short_window_secs && n >= 2 {
+                break;
+            }
+            let rps = r / dt;
+            sum_r_sq_per_sec += rps * rps;
+            dt_accum += dt;
+            n += 1;
+        }
+
+        if n < 2 {
+            return None;
+        }
+
+        let short_var_per_sec = sum_r_sq_per_sec / n as f64;
+        let short_vol = (short_var_per_sec * SECONDS_PER_YEAR).sqrt();
+
+        if short_vol.is_finite() && short_vol > 0.0 {
+            Some(short_vol / long_vol)
+        } else {
+            None
+        }
+    }
+
     /// Get the current EWMA variance (per-second, not annualized). None if not yet warmed up.
     pub fn ewma_variance(&self) -> Option<f64> {
         self.ewma_variance
@@ -487,6 +542,59 @@ mod tests {
         assert!(
             vol > 0.1 && vol < 3.0,
             "vol={vol} should be in reasonable range for 0.01%/sec oscillation"
+        );
+    }
+
+    // ── Vol regime ratio tests ──
+
+    #[test]
+    fn test_regime_ratio_none_without_data() {
+        let est = VolatilityEstimator::new(60, 1.0, 0.94, REF_DT);
+        assert!(est.vol_regime_ratio(300.0).is_none());
+    }
+
+    #[test]
+    fn test_regime_ratio_stable_near_one() {
+        // Constant oscillation → short and long vol should be similar → ratio ≈ 1.0
+        let mut est = VolatilityEstimator::new(200, 1.0, 0.94, REF_DT);
+        for i in 0..120 {
+            let price = if i % 2 == 0 { 68000.0 } else { 68050.0 };
+            est.add_price(price, 1000.0 + i as f64 * REF_DT);
+        }
+        let ratio = est.vol_regime_ratio(30.0); // 30-second short window
+        assert!(ratio.is_some(), "should have enough data for ratio");
+        let r = ratio.unwrap();
+        // Stable regime should be roughly 0.5..2.0 (not perfectly 1.0 due to EWMA weighting)
+        assert!(
+            r > 0.3 && r < 3.0,
+            "stable regime ratio should be near 1.0, got {r}"
+        );
+    }
+
+    #[test]
+    fn test_regime_ratio_spike_shows_expansion() {
+        let mut est = VolatilityEstimator::new(200, 1.0, 0.94, REF_DT);
+        // 80 ticks of calm (tiny moves)
+        for i in 0..80 {
+            est.add_price(68000.0 + (i as f64) * 0.05, 1000.0 + i as f64 * REF_DT);
+        }
+
+        // Then 10 ticks of high vol (large oscillations)
+        for i in 0..10 {
+            let sign = if i % 2 == 0 { 1.0 } else { -1.0 };
+            est.add_price(
+                68004.0 + sign * 200.0,
+                1000.0 + (80.0 + i as f64) * REF_DT,
+            );
+        }
+
+        let ratio = est.vol_regime_ratio(30.0); // last ~30s = high vol ticks
+        assert!(ratio.is_some());
+        let r = ratio.unwrap();
+        // Recent vol should be much higher than EWMA (which still carries calm history)
+        assert!(
+            r > 1.0,
+            "post-spike regime ratio should be > 1.0, got {r}"
         );
     }
 }

@@ -1,5 +1,6 @@
 pub mod calibration;
 pub mod models;
+pub mod momentum;
 pub mod volatility;
 
 use rust_decimal::prelude::ToPrimitive;
@@ -8,6 +9,7 @@ use crate::market_scanner::TargetMarket;
 use crate::price_feeds::{AggregatedPrice, FeedSource};
 
 pub use calibration::CalibrationTracker;
+pub use momentum::MomentumTracker;
 pub use volatility::VolatilityEstimator;
 
 /// Seconds per year (365.25 days × 24h × 3600s).
@@ -51,6 +53,16 @@ pub struct BayesianUpdater {
     vol_estimator: VolatilityEstimator,
     /// Default annualized volatility when estimator is not ready
     default_volatility: f64,
+    /// Minimum annualized volatility floor (0.0 = disabled)
+    vol_floor: f64,
+    /// Momentum tracker for mean-reversion signal
+    momentum_tracker: MomentumTracker,
+    /// Mean reversion lookback in seconds (0 = disabled)
+    reversion_lookback_secs: f64,
+    /// Base weight for reversion adjustment per sigma
+    reversion_weight: f64,
+    /// Extra multiplier for negative z-scores (downside reverts faster)
+    reversion_negative_mult: f64,
 }
 
 impl BayesianUpdater {
@@ -68,6 +80,10 @@ impl BayesianUpdater {
         lambda_reference_interval_secs: f64,
         default_volatility: f64,
         ewma_lambda: f64,
+        vol_floor: f64,
+        reversion_lookback_secs: f64,
+        reversion_weight: f64,
+        reversion_negative_mult: f64,
     ) -> Self {
         Self {
             vol_estimator: VolatilityEstimator::new(
@@ -77,6 +93,11 @@ impl BayesianUpdater {
                 lambda_reference_interval_secs,
             ),
             default_volatility,
+            vol_floor,
+            momentum_tracker: MomentumTracker::new(),
+            reversion_lookback_secs,
+            reversion_weight,
+            reversion_negative_mult,
         }
     }
 
@@ -96,6 +117,7 @@ impl BayesianUpdater {
 
         if vol_price > 0.0 {
             self.vol_estimator.add_price(vol_price, ts_secs);
+            self.momentum_tracker.add_price(vol_price, ts_secs);
         }
     }
 
@@ -170,11 +192,16 @@ impl BayesianUpdater {
             });
         }
 
-        // Get volatility estimate (time-aware EWMA or default)
-        let volatility = self
+        // Get volatility estimate (time-aware EWMA or default), clamped to floor.
+        let raw_vol = self
             .vol_estimator
             .annualized_volatility()
             .unwrap_or(self.default_volatility);
+        let volatility = if self.vol_floor > 0.0 {
+            raw_vol.max(self.vol_floor)
+        } else {
+            raw_vol
+        };
 
         if strike <= 0.0 {
             if !is_up_down_market(&market.question) {
@@ -208,8 +235,24 @@ impl BayesianUpdater {
         }
 
         // Compute model posterior from GBM
-        let model_posterior =
+        let mut model_posterior =
             models::binary_call_probability(spot, strike, time_to_expiry, volatility);
+
+        // Mean reversion adjustment: if price recently moved sharply, predict reversion.
+        // Negative z → price dropped → reversion predicts bounce UP → increase P(above strike).
+        // Positive z → price rose → reversion predicts pullback → decrease P(above strike).
+        if self.reversion_lookback_secs > 0.0 && self.reversion_weight > 0.0 {
+            if let Some(z) = self.momentum_tracker.z_score(self.reversion_lookback_secs) {
+                // Scale by sqrt(time_remaining / lookback) — reversion effect weakens near expiry
+                let time_scale = (time_to_expiry / self.reversion_lookback_secs).sqrt().min(1.0);
+                let mut adjustment = -z * self.reversion_weight * time_scale;
+                // Asymmetric: negative moves revert faster (multiply the upward adjustment)
+                if z < 0.0 {
+                    adjustment *= self.reversion_negative_mult;
+                }
+                model_posterior = (model_posterior + adjustment).clamp(0.001, 0.999);
+            }
+        }
 
         let adjusted_posterior = confidence * model_posterior + (1.0 - confidence) * market_implied;
 
@@ -268,6 +311,21 @@ impl BayesianUpdater {
     /// Whether the EWMA estimator has completed warmup.
     pub fn ewma_warmed_up(&self) -> bool {
         self.vol_estimator.is_warmed_up()
+    }
+
+    /// Get the volatility regime ratio (short-window RV / long-window RV).
+    /// > 1.5 = expanding vol, < 0.7 = contracting vol.
+    pub fn vol_regime_ratio(&self, short_window_secs: f64) -> Option<f64> {
+        self.vol_estimator.vol_regime_ratio(short_window_secs)
+    }
+
+    /// Get the current mean-reversion z-score over the configured lookback.
+    pub fn momentum_z_score(&self) -> Option<f64> {
+        if self.reversion_lookback_secs > 0.0 {
+            self.momentum_tracker.z_score(self.reversion_lookback_secs)
+        } else {
+            None
+        }
     }
 
     fn current_annualized_log_drift(&self) -> f64 {
@@ -372,7 +430,7 @@ mod tests {
 
     #[test]
     fn test_update_atm_market() {
-        let mut updater = BayesianUpdater::new(60, 1.0, 2.0, 0.80, 0.94);
+        let mut updater = BayesianUpdater::new(60, 1.0, 2.0, 0.80, 0.94, 0.0, 0.0, 0.0, 1.0);
         let price = make_price(68000.0, 1.0);
         let market = make_market(68000.0, 0.50, 300);
 
@@ -383,7 +441,7 @@ mod tests {
 
     #[test]
     fn test_update_itm_market() {
-        let mut updater = BayesianUpdater::new(60, 1.0, 2.0, 0.80, 0.94);
+        let mut updater = BayesianUpdater::new(60, 1.0, 2.0, 0.80, 0.94, 0.0, 0.0, 0.0, 1.0);
         let price = make_price(72000.0, 1.0);
         let market = make_market(68000.0, 0.60, 300);
 
@@ -394,7 +452,7 @@ mod tests {
 
     #[test]
     fn test_low_confidence_shrinks_to_market() {
-        let mut updater = BayesianUpdater::new(60, 1.0, 2.0, 0.80, 0.94);
+        let mut updater = BayesianUpdater::new(60, 1.0, 2.0, 0.80, 0.94, 0.0, 0.0, 0.0, 1.0);
         let price = make_price(72000.0, 0.0); // Zero confidence!
         let market = make_market(68000.0, 0.60, 300);
 
@@ -405,7 +463,7 @@ mod tests {
 
     #[test]
     fn test_expired_market() {
-        let mut updater = BayesianUpdater::new(60, 1.0, 2.0, 0.80, 0.94);
+        let mut updater = BayesianUpdater::new(60, 1.0, 2.0, 0.80, 0.94, 0.0, 0.0, 0.0, 1.0);
         let price = make_price(72000.0, 1.0);
         let market = make_market(68000.0, 0.60, -10); // Already expired
 
@@ -416,7 +474,7 @@ mod tests {
 
     #[test]
     fn test_update_up_down_market_without_official_reference_rejected() {
-        let mut updater = BayesianUpdater::new(60, 1.0, 2.0, 0.80, 0.94);
+        let mut updater = BayesianUpdater::new(60, 1.0, 2.0, 0.80, 0.94, 0.0, 0.0, 0.0, 1.0);
         let price = make_price(2800.0, 0.8);
         let mut market = make_up_down_market(0.70, 300);
         market.polymarket_price_to_beat = None;
@@ -429,7 +487,7 @@ mod tests {
 
     #[test]
     fn test_zero_strike_non_updown_market_rejected() {
-        let mut updater = BayesianUpdater::new(60, 1.0, 2.0, 0.80, 0.94);
+        let mut updater = BayesianUpdater::new(60, 1.0, 2.0, 0.80, 0.94, 0.0, 0.0, 0.0, 1.0);
         let price = make_price(68000.0, 1.0);
         let mut market = make_market(68000.0, 0.60, 300);
         market.strike_price = Decimal::ZERO;
@@ -440,7 +498,7 @@ mod tests {
 
     #[test]
     fn test_up_down_directional_model_uses_official_reference() {
-        let mut updater = BayesianUpdater::new(120, 1.0, 2.0, 0.80, 0.94);
+        let mut updater = BayesianUpdater::new(120, 1.0, 2.0, 0.80, 0.94, 0.0, 0.0, 0.0, 1.0);
         let now = Utc::now();
         for i in 0..90 {
             let ts = now - chrono::Duration::seconds(180 - (i as i64 * 2));
@@ -459,7 +517,7 @@ mod tests {
 
     #[test]
     fn test_up_down_directional_model_marks_below_reference_as_lower_prob() {
-        let mut updater = BayesianUpdater::new(120, 1.0, 2.0, 0.80, 0.94);
+        let mut updater = BayesianUpdater::new(120, 1.0, 2.0, 0.80, 0.94, 0.0, 0.0, 0.0, 1.0);
         let now = Utc::now();
         for i in 0..90 {
             let ts = now - chrono::Duration::seconds(180 - (i as i64 * 2));
@@ -480,7 +538,7 @@ mod tests {
     fn test_feed_price_extracts_binance_observation() {
         use crate::price_feeds::{PriceAsset, PriceObservation};
 
-        let mut updater = BayesianUpdater::new(60, 1.0, 2.0, 0.80, 0.94);
+        let mut updater = BayesianUpdater::new(60, 1.0, 2.0, 0.80, 0.94, 0.0, 0.0, 0.0, 1.0);
         let now = Utc::now();
 
         // First price with Binance observation
@@ -530,7 +588,7 @@ mod tests {
 
     #[test]
     fn test_feed_price_falls_back_to_median_without_binance() {
-        let mut updater = BayesianUpdater::new(60, 1.0, 2.0, 0.80, 0.94);
+        let mut updater = BayesianUpdater::new(60, 1.0, 2.0, 0.80, 0.94, 0.0, 0.0, 0.0, 1.0);
         let now = Utc::now();
 
         // Feed prices with no Binance observation (observations: Vec::new())

@@ -477,6 +477,7 @@ pub fn pipeline_payload(
             "obi_raw": d.obi_raw,
             "obi_adjustment": d.obi_adjustment,
             "posterior_pre_obi": d.posterior_pre_obi,
+            "vol_regime_ratio": d.vol_regime_ratio,
         },
         "execution_context": {
             "orderbook": orderbook_payload(book, depth_levels),

@@ -55,6 +55,9 @@ async fn main() -> anyhow::Result<()> {
     if let Some(dirs) = cli.replay_dirs {
         return polymarket_btc_bot::replay::run(&dirs, cli.run_filter.as_deref());
     }
+    if let Some(day_dirs) = cli.sweep_dirs {
+        return polymarket_btc_bot::replay::sweep(&day_dirs);
+    }
     if let Some(dirs) = cli.analyze_dirs {
         return polymarket_btc_bot::analyze::run(&dirs, cli.run_filter.as_deref());
     }
@@ -222,7 +225,13 @@ async fn main() -> anyhow::Result<()> {
                 .for_asset(asset)
                 .ewma_lambda
                 .unwrap_or(app_config.trading.ewma_lambda);
-            (asset, BayesianUpdater::new(vol_window_obs, 1.0, tick_secs, 0.80, lambda))
+            (asset, BayesianUpdater::new(
+                vol_window_obs, 1.0, tick_secs, 0.80, lambda,
+                app_config.trading.min_annualized_vol,
+                app_config.trading.reversion_lookback_secs,
+                app_config.trading.reversion_weight,
+                app_config.trading.reversion_negative_mult,
+            ))
         })
         .collect();
 
@@ -367,6 +376,7 @@ struct CliArgs {
     runs_dirs: Option<Vec<String>>,
     backtest_dirs: Option<Vec<String>>,
     replay_dirs: Option<Vec<String>>,
+    sweep_dirs: Option<Vec<Vec<String>>>,
     run_filter: Option<String>,
 }
 
@@ -407,6 +417,7 @@ fn parse_cli_args() -> CliArgs {
             runs_dirs: Some(dirs),
             backtest_dirs: None,
             replay_dirs: None,
+            sweep_dirs: None,
             run_filter: None,
         };
     }
@@ -426,6 +437,7 @@ fn parse_cli_args() -> CliArgs {
             runs_dirs: None,
             backtest_dirs: Some(dirs),
             replay_dirs: None,
+            sweep_dirs: None,
             run_filter,
         };
     }
@@ -445,7 +457,30 @@ fn parse_cli_args() -> CliArgs {
             runs_dirs: None,
             backtest_dirs: None,
             replay_dirs: Some(dirs),
+            sweep_dirs: None,
             run_filter,
+        };
+    }
+
+    // --sweep logs/2026-02-26 logs/2026-02-27
+    // Each non-flag arg is a separate day's log directory
+    let sweep_mode = args_without_run.iter().any(|a| a == "--sweep");
+    if sweep_mode {
+        let day_dirs: Vec<Vec<String>> = args_without_run
+            .iter()
+            .filter(|a| !a.starts_with("--"))
+            .map(|d| vec![d.clone()])
+            .collect();
+        return CliArgs {
+            config_path: String::new(),
+            paper_mode: false,
+            no_log: false,
+            analyze_dirs: None,
+            runs_dirs: None,
+            backtest_dirs: None,
+            replay_dirs: None,
+            sweep_dirs: Some(day_dirs),
+            run_filter: None,
         };
     }
 
@@ -465,6 +500,7 @@ fn parse_cli_args() -> CliArgs {
             runs_dirs: None,
             backtest_dirs: None,
             replay_dirs: None,
+            sweep_dirs: None,
             run_filter,
         };
     }
@@ -485,6 +521,7 @@ fn parse_cli_args() -> CliArgs {
         runs_dirs: None,
         backtest_dirs: None,
         replay_dirs: None,
+        sweep_dirs: None,
         run_filter: None,
     }
 }
@@ -774,8 +811,13 @@ mod tests {
                 yes_edge_threshold_mult: Decimal::ONE,
                 no_edge_threshold_mult: Decimal::ONE,
                 prob_shrinkage_alpha: None,
+                min_conviction: 0.0,
+                min_annualized_vol: 0.0,
                 obi_weight: 0.0,
                 obi_depth_levels: 5,
+                reversion_lookback_secs: 0.0,
+                reversion_weight: 0.0,
+                reversion_negative_mult: 1.0,
             },
             risk: config::RiskConfig {
                 max_position_usdc: Decimal::from(500),

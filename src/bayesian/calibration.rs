@@ -121,9 +121,9 @@ impl CalibrationTracker {
     /// allowing trades to flow through the Kelly gate while calibration data accumulates.
     pub fn model_uncertainty_warmup(&self, min_samples: usize) -> f64 {
         if self.history.len() < min_samples {
-            return 0.15; // Optimistic default during warmup
+            return 0.30; // Conservative default during warmup — halve Kelly sizing until calibrated
         }
-        self.report().map(|r| r.model_uncertainty).unwrap_or(0.15)
+        self.report().map(|r| r.model_uncertainty).unwrap_or(0.30)
     }
 
     /// Save calibration history to a JSON file.
@@ -288,13 +288,13 @@ mod tests {
     }
 
     #[test]
-    fn test_warmup_returns_low_default() {
+    fn test_warmup_returns_conservative_default() {
         let mut tracker = CalibrationTracker::new(100);
-        // With < 30 samples, warmup should return 0.15
+        // With < 30 samples, warmup should return 0.30 (conservative)
         for _ in 0..10 {
             tracker.record(0.5, true, "test".into());
         }
-        assert_eq!(tracker.model_uncertainty_warmup(30), 0.15);
+        assert_eq!(tracker.model_uncertainty_warmup(30), 0.30);
     }
 
     #[test]

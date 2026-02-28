@@ -16,6 +16,7 @@ Built in Rust for low-latency execution (~2-6s tick-to-order).
 - [CLI Usage](#cli-usage)
 - [Dashboard](#dashboard)
 - [Versioning](#versioning)
+- [Parameter Tuning History](#parameter-tuning-history)
 - [Roadmap](#roadmap)
 
 ---
@@ -267,6 +268,17 @@ A real-time browser dashboard is served on `http://localhost:8080` (paper) or `h
 
 ## Versioning
 
+### v1.9.0 — Sweep-Optimized Parameters
+*Tag: `v1.9.0`*
+
+- **`--sweep` mode**: Grid-search parameter optimizer that replays logged pipeline evaluations across multiple days with thousands of parameter combinations. Reports P&L, win rate, Brier score per config, ranked by consistency (profitable on all days).
+- **NO-only trading**: YES trades disabled (`yes_edge_threshold_mult=999.0`) — retail optimism premium makes YES tokens systematically overpriced.
+- **Smoother volatility**: `ewma_lambda` raised from 0.94 to 0.97 across all assets; `min_annualized_vol` lowered from 0.15 to 0.10.
+- **Tighter conviction filter**: `min_conviction` doubled from 0.08 to 0.16.
+- **Mean reversion re-enabled**: `reversion_weight=0.05` with shorter 120s lookback (was disabled at 0.0).
+- **OBI signal activated**: `obi_weight` raised from 0.02 to 0.10 (log-odds adjustment from orderbook imbalance).
+- **Looser NO threshold**: `no_edge_threshold_mult` reduced from 1.5 to 1.20, allowing more NO trades.
+
 ### v1.8.2 — Replay Mode & Conviction Filter
 *Tag: `v1.8.2`*
 
@@ -328,6 +340,61 @@ Initial release with all core systems:
 - Paper mode with simulated fills
 - Real-time browser dashboard (axum + Chart.js)
 - JSONL structured logging
+
+---
+
+## Parameter Tuning History
+
+Each version's parameter changes, with before/after values and the empirical feedback that motivated each change.
+
+### v1.0.0 — Initial Baseline
+
+All defaults established. No tuning data yet.
+
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| `edge_threshold` | 0.11 | 11% minimum net edge to trade |
+| `ewma_lambda` | 0.94 | RiskMetrics standard |
+| `kelly_fraction` | 0.20 | Conservative fractional Kelly |
+
+### v1.1.0 — First Tuning Pass
+
+| Parameter | Before | After | Feedback |
+|-----------|--------|-------|----------|
+| `max_net_edge` | — | 0.20 | Edges >20% had 33% WR — suspiciously large edges are mispriced, not profitable |
+| `no_edge_threshold_mult` | 1.0 | 1.2 | NO side was taking low-edge trades that lost money; 20% higher bar improved quality |
+
+### v1.5.0 — Simplified Baseline (Reverted to Run 8)
+
+| Parameter | Before | After | Feedback |
+|-----------|--------|-------|----------|
+| Per-asset edge mults | Various overrides | Reverted to 1.0 | Over-tuned per-asset multipliers hurt combined performance |
+| `obi_weight` | — | 0.0 | Infrastructure plumbed but disabled pending calibration data |
+
+### v1.8.2 — Vol Fix + Conviction Filter
+
+| Parameter | Before | After | Feedback |
+|-----------|--------|-------|----------|
+| `min_annualized_vol` | — | 0.15 | Prevents near-zero vol from producing 0.99+ posteriors |
+| `min_conviction` | — | 0.08 | Filters trades where posterior is near 0.50 (no directional signal) |
+| `yes_edge_threshold_mult` | 1.0 | 2.0 | YES side had 34% WR, -$1,716 P&L — retail optimism premium |
+
+### v1.9.0 — Sweep-Optimized (2-day backtest: Feb 26-27, 424 settlements)
+
+Parameter sweep infrastructure (`--sweep` mode) tested 9,000 configurations across 2 days. All top configs shared the same structural patterns: NO-only trading, smoother vol, and tighter conviction filters.
+
+| Parameter | Before | After | Feedback |
+|-----------|--------|-------|----------|
+| `ewma_lambda` | 0.94 | 0.97 | Smoother vol estimate; appeared in ALL top-25 sweep configs |
+| `min_annualized_vol` | 0.15 | 0.10 | Lower vol floor allows wider posterior range; dominated in sweep |
+| `min_conviction` | 0.08 | 0.16 | 2x stricter filtering; removes low-conviction noise trades |
+| `yes_edge_threshold_mult` | 2.0 | 999.0 | NO-only: YES had 34% WR across all data; every top config disabled YES |
+| `no_edge_threshold_mult` | 1.5 | 1.20 | Looser NO threshold allows more NO trades (NO had 64% WR) |
+| `reversion_weight` | 0.0 | 0.05 | Re-enabled mean reversion; 120s lookback + 0.05 weight beat disabled |
+| `reversion_lookback_secs` | 180.0 | 120.0 | Shorter 2-min window captured reversion better than 3-min |
+| `obi_weight` | 0.02 | 0.10 | 5x stronger OBI signal; marginal but consistent improvement |
+
+**Backtest result**: Combined P&L improved from -$2,741 to +$2,430 across both days. Caveat: only 2 days / 424 settlements — directional, not definitive.
 
 ---
 

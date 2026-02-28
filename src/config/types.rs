@@ -142,12 +142,30 @@ pub struct TradingConfig {
     /// 1.0 = pure model (no shrinkage), 0.5 = 50/50. None = disabled (same as 1.0).
     #[serde(default)]
     pub prob_shrinkage_alpha: Option<f64>,
+    /// Minimum |posterior - 0.50| to allow a trade. Filters low-conviction noise.
+    /// 0.0 = disabled (default). 0.08 = require at least 42% or 58% posterior.
+    #[serde(default)]
+    pub min_conviction: f64,
+    /// Minimum annualized volatility floor for GBM probability computation.
+    /// Prevents extreme probabilities during low-vol regimes. 0.0 = disabled.
+    #[serde(default)]
+    pub min_annualized_vol: f64,
     /// P6: Orderbook imbalance weight in log-odds space. 0.0 = disabled.
     #[serde(default)]
     pub obi_weight: f64,
     /// P6: Number of orderbook levels to include (0 = all levels).
     #[serde(default = "default_obi_depth_levels")]
     pub obi_depth_levels: usize,
+    /// Mean reversion lookback window in seconds. 0.0 = disabled.
+    #[serde(default)]
+    pub reversion_lookback_secs: f64,
+    /// Mean reversion weight: probability adjustment per sigma of recent move.
+    /// 0.03 = ~3% probability shift per sigma.
+    #[serde(default)]
+    pub reversion_weight: f64,
+    /// Extra multiplier for negative z-scores (downside reverts faster). 1.0 = symmetric.
+    #[serde(default = "default_reversion_negative_mult")]
+    pub reversion_negative_mult: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -260,6 +278,10 @@ fn default_multiplier() -> Decimal {
 
 fn default_obi_depth_levels() -> usize {
     5
+}
+
+fn default_reversion_negative_mult() -> f64 {
+    1.0
 }
 
 #[derive(Debug, Clone, Deserialize)]

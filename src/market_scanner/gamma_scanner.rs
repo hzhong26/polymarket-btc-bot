@@ -313,8 +313,13 @@ mod tests {
             yes_edge_threshold_mult: Decimal::ONE,
             no_edge_threshold_mult: Decimal::ONE,
             prob_shrinkage_alpha: None,
+            min_conviction: 0.0,
+            min_annualized_vol: 0.0,
             obi_weight: 0.0,
             obi_depth_levels: 5,
+            reversion_lookback_secs: 0.0,
+            reversion_weight: 0.0,
+            reversion_negative_mult: 1.0,
         }
     }
 

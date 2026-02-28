@@ -69,6 +69,7 @@ pub struct PipelineDiagnostics {
     pub obi_raw: Option<f64>,
     pub obi_adjustment: Option<f64>,
     pub posterior_pre_obi: Option<f64>,
+    pub vol_regime_ratio: Option<f64>,
 }
 
 /// What action (if any) should be taken for this market.
@@ -156,6 +157,7 @@ pub fn evaluate_market(
     prob_shrinkage_alpha: Option<f64>,
     obi_weight: f64,
     obi_depth_levels: usize,
+    min_conviction: f64,
 ) -> PipelineResult {
     let market_asset = PriceAsset::from_market_question(&market.question);
     let aggregated_spot = price.spot_usd.to_f64();
@@ -208,6 +210,7 @@ pub fn evaluate_market(
         obi_raw: None,
         obi_adjustment: None,
         posterior_pre_obi: None,
+        vol_regime_ratio: None,
     };
 
     if let Some(asset) = market_asset {
@@ -355,8 +358,42 @@ pub fn evaluate_market(
     }
     diagnostics.posterior = Some(posterior);
 
-    let effective_threshold =
+    // Conviction floor: skip trades where posterior is too close to 0.50.
+    if min_conviction > 0.0 {
+        let conviction = (posterior - 0.5).abs();
+        if conviction < min_conviction {
+            return PipelineResult {
+                market: market.clone(),
+                edge_result: None,
+                position: None,
+                diagnostics,
+                action: PipelineAction::NoTrade {
+                    reason: format!(
+                        "conviction {:.4} below minimum {:.4} (posterior={:.4})",
+                        conviction, min_conviction, posterior
+                    ),
+                },
+            };
+        }
+    }
+
+    let mut effective_threshold =
         compute_effective_threshold(base_edge_threshold, confidence, spread, model_uncertainty);
+
+    // Volatility regime adjustment: widen threshold during expanding vol, narrow during contracting.
+    // Short window = 300s (5 min) vs EWMA long-term estimate.
+    let regime_ratio = bayesian.vol_regime_ratio(300.0);
+    diagnostics.vol_regime_ratio = regime_ratio;
+    if let Some(ratio) = regime_ratio {
+        if ratio > 1.5 {
+            // Expanding vol: require 50% more edge (high uncertainty regime)
+            effective_threshold *= 1.5;
+        } else if ratio < 0.7 {
+            // Contracting vol: allow 10% less edge (range-bound, more predictable)
+            effective_threshold *= 0.9;
+        }
+    }
+
     diagnostics.edge_threshold = effective_threshold;
 
     // Step 3: preliminary edge on probe size.
