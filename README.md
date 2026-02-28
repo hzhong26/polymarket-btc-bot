@@ -69,6 +69,7 @@ Built in Rust for low-latency execution (~2-6s tick-to-order).
 | **dashboard_server** | `src/dashboard_server.rs` | Real-time browser dashboard (axum HTTP/WS + embedded Chart.js) |
 | **config** | `src/config/` | Configuration types & TOML loading |
 | **analyze** | `src/analyze.rs` | Post-session analysis: calibration curves, Brier decomposition, tuning recommendations |
+| **replay** | `src/replay.rs` | Vol fix impact analysis: replays pipeline evals with new vol estimator |
 | **backtest** | `src/backtest.rs` | Parameter sweep backtester replaying logged pipeline evaluations |
 | **timezone** | `src/timezone.rs` | Eastern Time conversion (Polymarket market windows use ET) |
 
@@ -238,6 +239,9 @@ polymarket-btc-bot --runs [log-dirs...]
 
 # Parameter sweep backtester (replays logged pipeline evaluations)
 polymarket-btc-bot --backtest [log-dir] [--run N]
+
+# Replay with new vol estimator (compares old vs new vol, Brier, P&L)
+polymarket-btc-bot --replay [log-dirs...] [--run N]
 ```
 
 ---
@@ -262,6 +266,14 @@ A real-time browser dashboard is served on `http://localhost:8080` (paper) or `h
 ---
 
 ## Versioning
+
+### v1.8.2 — Replay Mode & Conviction Filter
+*Tag: `v1.8.2`*
+
+- **`--replay` mode**: Replays logged pipeline evaluations through the new vol estimator, comparing old vs new volatility, posteriors, Brier scores, decision changes, and hypothetical P&L using actual settlement outcomes.
+- **Vol floor** (`MIN_ANNUALIZED_VOL=0.15`): Prevents unrealistically low vol estimates from producing overconfident posteriors.
+- **Conviction filter** (`MIN_CONVICTION=0.08`): Rejects trades where the posterior is too close to 0.50 (low directional conviction).
+- **Brier score comparison**: Per-asset old vs new Brier scores in replay report.
 
 ### v1.8.0 — Time-Aware Volatility & Raw Price Signal
 *Tag: `v1.8.0`*
